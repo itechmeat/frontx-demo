@@ -1,0 +1,1114 @@
+/**
+ * QueryCache Plugin - shared QueryClient lifecycle management
+ *
+ * Framework Layer: L2
+ *
+ * Owns the shared QueryClient lifecycle, cache invalidation via Flux events,
+ * cache clearing when mock mode, tenant or session changes (host queryCache()
+ * only), and cleanup on destroy.
+ * Zero React imports — this plugin is headless.
+ */
+
+import {
+  peekSharedFetchCache,
+  releaseSharedFetchCache,
+  retainSharedFetchCache,
+} from '@gears-frontx/api';
+import { QueryClient, type Mutation } from '@tanstack/query-core';
+import { eventBus, getStore, type Subscription } from '@gears-frontx/state';
+import type { FrontXApp, FrontXPlugin } from '../types';
+import { MockEvents } from '../effects/mockEffects';
+import { TenantEvents } from '../effects/tenantEffects';
+import { AuthEvents } from './auth';
+import { TENANT_SLICE_NAME } from '../slices';
+
+const QUERY_CACHE_RUNTIME_CHANGED_EVENT = 'cache/runtime/changed' as const;
+
+declare module '@gears-frontx/state' {
+  interface EventPayloadMap {
+    'cache/runtime/changed': CacheRuntimeChangedPayload;
+    'cache/invalidate': CacheInvalidatePayload;
+    'cache/set': CacheSetPayload;
+    'cache/remove': CacheRemovePayload;
+  }
+}
+
+type QueryCacheKey = readonly unknown[];
+type QueryCacheRefetchMode = 'active' | 'inactive' | 'all' | 'none';
+type QueryCacheUpdater<T> = T | ((old: T | undefined) => T | undefined);
+
+interface QueryCacheInvalidateFilters {
+  queryKey: QueryCacheKey;
+  exact?: boolean;
+  refetchType?: QueryCacheRefetchMode;
+}
+
+interface CacheEventBase {
+  source?: string;
+}
+
+interface CacheRuntimeChangedPayload {
+  available: boolean;
+}
+
+interface CacheInvalidatePayload extends QueryCacheInvalidateFilters, CacheEventBase {}
+
+interface CacheSetPayload extends CacheEventBase {
+  queryKey: QueryCacheKey;
+  dataOrUpdater: QueryCacheUpdater<unknown>;
+}
+
+interface CacheRemovePayload extends CacheEventBase {
+  queryKey: QueryCacheKey;
+}
+
+const SHARED_QUERY_CLIENT_SYMBOL = Symbol.for('frontx:query-cache:shared-client');
+const SHARED_QUERY_CLIENT_RETAINERS_SYMBOL = Symbol.for('frontx:query-cache:shared-client-retainers');
+const SHARED_QUERY_CLIENT_CONFIG_SYMBOL = Symbol.for('frontx:query-cache:shared-client-config');
+const SHARED_QUERY_CLIENT_TEARDOWN_TOKEN_SYMBOL = Symbol.for(
+  'frontx:query-cache:shared-client-teardown-token'
+);
+const QUERY_CLIENT_BROADCAST_TARGET_SYMBOL = Symbol.for('frontx:query-cache:broadcast-target');
+const QUERY_CLIENT_BROADCAST_COUNTER_SYMBOL = Symbol.for('frontx:query-cache:broadcast-counter');
+const QUERY_CLIENT_SCOPE_GENERATION_SYMBOL = Symbol.for('frontx:query-cache:scope-generation');
+const QUERY_CLIENT_DROPPED_WRITE_GENERATION_SYMBOL = Symbol.for('frontx:query-cache:dropped-write-generation');
+const APP_QUERY_CLIENT_SYMBOL = Symbol.for('frontx:query-cache:app-client');
+const APP_QUERY_CLIENT_RESOLVER_SYMBOL = Symbol.for('frontx:query-cache:app-client-resolver');
+const APP_QUERY_CLIENT_ACTIVATOR_SYMBOL = Symbol.for('frontx:query-cache:app-client-activator');
+const DUPLICATE_PLUGIN_CLEANUP_SYMBOL = Symbol.for('frontx:plugin:duplicate-cleanup');
+
+type QueryClientWithMetadata = QueryClient & {
+  [QUERY_CLIENT_BROADCAST_TARGET_SYMBOL]?: string;
+  [QUERY_CLIENT_SCOPE_GENERATION_SYMBOL]?: number;
+  [QUERY_CLIENT_DROPPED_WRITE_GENERATION_SYMBOL]?: number;
+};
+
+type QueryClientApp = FrontXApp & {
+  [APP_QUERY_CLIENT_SYMBOL]?: QueryClient;
+  [APP_QUERY_CLIENT_RESOLVER_SYMBOL]?: () => QueryClient | undefined;
+  [APP_QUERY_CLIENT_ACTIVATOR_SYMBOL]?: () => QueryClient | undefined;
+};
+
+type QueryCachePlugin = FrontXPlugin & {
+  [DUPLICATE_PLUGIN_CLEANUP_SYMBOL]?: () => void;
+};
+
+type SharedQueryClientHost = typeof globalThis & {
+  [SHARED_QUERY_CLIENT_SYMBOL]?: QueryClient;
+  [SHARED_QUERY_CLIENT_RETAINERS_SYMBOL]?: number;
+  [SHARED_QUERY_CLIENT_CONFIG_SYMBOL]?: ResolvedQueryCacheConfig;
+  [SHARED_QUERY_CLIENT_TEARDOWN_TOKEN_SYMBOL]?: number;
+  [QUERY_CLIENT_BROADCAST_COUNTER_SYMBOL]?: number;
+};
+
+type CacheEffectsEntry = {
+  retainers: number;
+  cleanup: () => void;
+  disposed: boolean;
+};
+
+type SharedFetchCacheInvalidator = {
+  invalidate(key: readonly unknown[]): void;
+  invalidateMany?: (filters?: { key?: readonly unknown[]; exact?: boolean }) => void;
+  clear(): void;
+};
+
+type InvalidatePayloadInput = {
+  queryKey?: unknown;
+  exact?: boolean;
+  refetchType?: QueryCacheInvalidateFilters['refetchType'];
+};
+
+type CacheSetPayloadInput = {
+  queryKey?: unknown;
+  dataOrUpdater?: unknown;
+  source?: unknown;
+};
+
+type CacheRemovePayloadInput = {
+  queryKey?: unknown;
+  source?: unknown;
+};
+
+type ResolvedQueryCacheConfig = Required<QueryCacheConfig>;
+
+const cacheEffectsByClient = new WeakMap<QueryClient, CacheEffectsEntry>();
+// Host-only: queryCacheShared() never retains an entry here, so a child runtime
+// cannot clear the host's cache.
+const hostClearEffectsByClient = new WeakMap<QueryClient, CacheEffectsEntry>();
+
+type CacheScopeState = {
+  // Mock mode and tenant the cached data was fetched under.
+  mockEnabled: boolean;
+  tenantId: string | null;
+  // The scope changed while no host was present to clear the cache.
+  stale: boolean;
+};
+
+// Lives with the cache effects entry, which host and child runtimes both
+// retain, so a scope change survives a host leaving and rejoining.
+const cacheScopeByClient = new WeakMap<QueryClient, CacheScopeState>();
+
+function finalizeCacheEffectsEntry(
+  entries: WeakMap<QueryClient, CacheEffectsEntry>,
+  queryClient: QueryClient,
+  entry: CacheEffectsEntry
+): void {
+  if (entry.disposed) {
+    return;
+  }
+
+  entry.disposed = true;
+  entry.cleanup();
+  entries.delete(queryClient);
+}
+
+/**
+ * The number of cache scope changes (mock mode, tenant, login, logout) this
+ * QueryClient has seen. A caller that records it before async work and finds
+ * it moved afterwards knows its result belongs to a scope that is gone. Kept
+ * on the client itself, so every runtime sharing the client reads the same
+ * count whichever framework copy recorded the change.
+ */
+export function readQueryCacheScopeGeneration(queryClient: QueryClient): number {
+  return (queryClient as QueryClientWithMetadata)[QUERY_CLIENT_SCOPE_GENERATION_SYMBOL] ?? 0;
+}
+
+/**
+ * Records that a write meant for this QueryClient was dropped because the
+ * cache scope moved since the work started at `startGeneration` (a mutation
+ * callback's write after a session check, for one). When a session check
+ * keeps the session, the cache refreshes only if work started under the scope
+ * that check found had a write dropped; a drop from work that predates an
+ * earlier clear needs no repair. Kept on the client, like the scope
+ * generation.
+ */
+export function recordQueryCacheScopeWriteDropped(queryClient: QueryClient, startGeneration: number): void {
+  const client = queryClient as QueryClientWithMetadata;
+  client[QUERY_CLIENT_DROPPED_WRITE_GENERATION_SYMBOL] = Math.max(
+    client[QUERY_CLIENT_DROPPED_WRITE_GENERATION_SYMBOL] ?? -1,
+    startGeneration
+  );
+}
+
+/** The latest start generation among dropped writes, or -1 when none was dropped. */
+function readLatestDroppedWriteGeneration(queryClient: QueryClient): number {
+  return (queryClient as QueryClientWithMetadata)[QUERY_CLIENT_DROPPED_WRITE_GENERATION_SYMBOL] ?? -1;
+}
+
+function bumpQueryCacheScopeGeneration(queryClient: QueryClient): void {
+  (queryClient as QueryClientWithMetadata)[QUERY_CLIENT_SCOPE_GENERATION_SYMBOL] =
+    readQueryCacheScopeGeneration(queryClient) + 1;
+}
+
+function emitSharedQueryClientRuntimeChanged(available: boolean): void {
+  eventBus.emit(QUERY_CACHE_RUNTIME_CHANGED_EVENT, { available });
+}
+
+/**
+ * Subscribe to shared QueryClient availability changes (host init, teardown, MFE join).
+ * Keeps the Flux event name internal to the queryCache plugin.
+ */
+export function subscribeQueryCacheRuntimeChanged(listener: () => void): Subscription {
+  return eventBus.on(QUERY_CACHE_RUNTIME_CHANGED_EVENT, () => {
+    listener();
+  });
+}
+
+function resolveQueryCacheConfig(config?: QueryCacheConfig): ResolvedQueryCacheConfig {
+  return {
+    staleTime: config?.staleTime ?? 30_000,
+    gcTime: config?.gcTime ?? 300_000,
+    refetchOnWindowFocus: config?.refetchOnWindowFocus ?? true,
+  };
+}
+
+function isSameQueryCacheConfig(
+  left: ResolvedQueryCacheConfig,
+  right: ResolvedQueryCacheConfig
+): boolean {
+  return (
+    left.staleTime === right.staleTime &&
+    left.gcTime === right.gcTime &&
+    left.refetchOnWindowFocus === right.refetchOnWindowFocus
+  );
+}
+
+function resolveSharedQueryClientRetainers(host: SharedQueryClientHost): number {
+  const retainers = host[SHARED_QUERY_CLIENT_RETAINERS_SYMBOL];
+  if (typeof retainers !== 'number' || !Number.isFinite(retainers) || retainers < 0) {
+    return 0;
+  }
+
+  return retainers;
+}
+
+function resolveSharedQueryClientTeardownToken(host: SharedQueryClientHost): number {
+  const token = host[SHARED_QUERY_CLIENT_TEARDOWN_TOKEN_SYMBOL];
+  if (typeof token !== 'number' || !Number.isInteger(token) || token < 0) {
+    return 0;
+  }
+
+  return token;
+}
+
+function ensureQueryClientBroadcastTarget(queryClient: QueryClient): string {
+  const clientWithMetadata = queryClient as QueryClientWithMetadata;
+  const existingTarget = clientWithMetadata[QUERY_CLIENT_BROADCAST_TARGET_SYMBOL];
+  if (typeof existingTarget === 'string' && existingTarget.length > 0) {
+    return existingTarget;
+  }
+
+  const host = globalThis as SharedQueryClientHost;
+  const nextCounter = (host[QUERY_CLIENT_BROADCAST_COUNTER_SYMBOL] ?? 0) + 1;
+  host[QUERY_CLIENT_BROADCAST_COUNTER_SYMBOL] = nextCounter;
+
+  const broadcastTarget = `query-cache-${nextCounter}`;
+  clientWithMetadata[QUERY_CLIENT_BROADCAST_TARGET_SYMBOL] = broadcastTarget;
+  return broadcastTarget;
+}
+
+function attachQueryClientToApp(app: FrontXApp, queryClient: QueryClient): void {
+  (app as QueryClientApp)[APP_QUERY_CLIENT_SYMBOL] = queryClient;
+}
+
+function detachQueryClientFromApp(app: FrontXApp, queryClient: QueryClient): void {
+  const clientApp = app as QueryClientApp;
+  if (clientApp[APP_QUERY_CLIENT_SYMBOL] === queryClient) {
+    delete clientApp[APP_QUERY_CLIENT_SYMBOL];
+  }
+}
+
+function attachQueryClientResolverToApp(
+  app: FrontXApp,
+  resolver: () => QueryClient | undefined
+): void {
+  (app as QueryClientApp)[APP_QUERY_CLIENT_RESOLVER_SYMBOL] = resolver;
+}
+
+function detachQueryClientResolverFromApp(app: FrontXApp): void {
+  delete (app as QueryClientApp)[APP_QUERY_CLIENT_RESOLVER_SYMBOL];
+}
+
+function attachQueryClientActivatorToApp(
+  app: FrontXApp,
+  activator: () => QueryClient | undefined
+): void {
+  (app as QueryClientApp)[APP_QUERY_CLIENT_ACTIVATOR_SYMBOL] = activator;
+}
+
+function detachQueryClientActivatorFromApp(app: FrontXApp): void {
+  delete (app as QueryClientApp)[APP_QUERY_CLIENT_ACTIVATOR_SYMBOL];
+}
+
+function createSharedQueryClient(config?: QueryCacheConfig): QueryClient {
+  const resolvedConfig = resolveQueryCacheConfig(config);
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: {
+        staleTime: resolvedConfig.staleTime,
+        gcTime: resolvedConfig.gcTime,
+        retry: 0,
+        refetchOnWindowFocus: resolvedConfig.refetchOnWindowFocus,
+      },
+    },
+  });
+  ensureQueryClientBroadcastTarget(queryClient);
+
+  const host = globalThis as SharedQueryClientHost;
+  host[SHARED_QUERY_CLIENT_CONFIG_SYMBOL] = resolvedConfig;
+  return queryClient;
+}
+
+function getSharedQueryClient(config?: QueryCacheConfig): QueryClient {
+  const host = globalThis as SharedQueryClientHost;
+  const existingClient = host[SHARED_QUERY_CLIENT_SYMBOL];
+  const resolvedConfig = resolveQueryCacheConfig(config);
+
+  if (!existingClient) {
+    const createdClient = createSharedQueryClient(config);
+    host[SHARED_QUERY_CLIENT_SYMBOL] = createdClient;
+    return createdClient;
+  }
+
+  const existingConfig = host[SHARED_QUERY_CLIENT_CONFIG_SYMBOL];
+  if (existingConfig && !isSameQueryCacheConfig(existingConfig, resolvedConfig)) {
+    throw new Error(
+      '[Gears FrontX] queryCache() received a config that conflicts with the existing shared QueryClient.'
+    );
+  }
+
+  ensureQueryClientBroadcastTarget(existingClient);
+  return existingClient;
+}
+
+function peekSharedQueryClient(): QueryClient | undefined {
+  return (globalThis as SharedQueryClientHost)[SHARED_QUERY_CLIENT_SYMBOL];
+}
+
+function retainSharedQueryClient(config?: QueryCacheConfig): QueryClient {
+  const host = globalThis as SharedQueryClientHost;
+  const queryClient = getSharedQueryClient(config);
+  const retainers = resolveSharedQueryClientRetainers(host);
+  host[SHARED_QUERY_CLIENT_RETAINERS_SYMBOL] = retainers + 1;
+  if (retainers === 0) {
+    host[SHARED_QUERY_CLIENT_TEARDOWN_TOKEN_SYMBOL] = resolveSharedQueryClientTeardownToken(host) + 1;
+  }
+  emitSharedQueryClientRuntimeChanged(true);
+  return queryClient;
+}
+
+function retainExistingSharedQueryClient(): QueryClient {
+  const host = globalThis as SharedQueryClientHost;
+  const queryClient = host[SHARED_QUERY_CLIENT_SYMBOL];
+  if (!queryClient) {
+    throw new Error(
+      '[Gears FrontX] queryCacheShared() requires an existing host queryCache() runtime.'
+    );
+  }
+
+  ensureQueryClientBroadcastTarget(queryClient);
+  const retainers = resolveSharedQueryClientRetainers(host);
+  host[SHARED_QUERY_CLIENT_RETAINERS_SYMBOL] = retainers + 1;
+  if (retainers === 0) {
+    host[SHARED_QUERY_CLIENT_TEARDOWN_TOKEN_SYMBOL] = resolveSharedQueryClientTeardownToken(host) + 1;
+  }
+  return queryClient;
+}
+
+function releaseSharedQueryClient(): { released: boolean; isLastRetainer: boolean; teardownToken: number } {
+  const host = globalThis as SharedQueryClientHost;
+  const retainers = resolveSharedQueryClientRetainers(host);
+
+  if (retainers === 0) {
+    return { released: false, isLastRetainer: false, teardownToken: 0 };
+  }
+
+  if (retainers === 1) {
+    const teardownToken = resolveSharedQueryClientTeardownToken(host) + 1;
+    host[SHARED_QUERY_CLIENT_RETAINERS_SYMBOL] = 0;
+    host[SHARED_QUERY_CLIENT_TEARDOWN_TOKEN_SYMBOL] = teardownToken;
+    return { released: true, isLastRetainer: true, teardownToken };
+  }
+
+  host[SHARED_QUERY_CLIENT_RETAINERS_SYMBOL] = retainers - 1;
+  return { released: true, isLastRetainer: false, teardownToken: 0 };
+}
+
+function finalizeReleasedSharedQueryClient(queryClient: QueryClient, teardownToken: number): boolean {
+  const host = globalThis as SharedQueryClientHost;
+  if (host[SHARED_QUERY_CLIENT_SYMBOL] !== queryClient) {
+    return false;
+  }
+
+  if (resolveSharedQueryClientRetainers(host) !== 0) {
+    return false;
+  }
+
+  if (resolveSharedQueryClientTeardownToken(host) !== teardownToken) {
+    return false;
+  }
+
+  queryClient.clear();
+  delete host[SHARED_QUERY_CLIENT_SYMBOL];
+  delete host[SHARED_QUERY_CLIENT_RETAINERS_SYMBOL];
+  delete host[SHARED_QUERY_CLIENT_CONFIG_SYMBOL];
+  delete host[SHARED_QUERY_CLIENT_TEARDOWN_TOKEN_SYMBOL];
+  emitSharedQueryClientRuntimeChanged(false);
+  return true;
+}
+
+export function resetSharedQueryClient(): void {
+  const host = globalThis as SharedQueryClientHost;
+  const client = host[SHARED_QUERY_CLIENT_SYMBOL];
+  if (client) {
+    for (const entries of [cacheEffectsByClient, hostClearEffectsByClient]) {
+      const cacheEffects = entries.get(client);
+      if (cacheEffects) {
+        finalizeCacheEffectsEntry(entries, client, cacheEffects);
+      }
+    }
+
+    client.clear();
+  }
+
+  delete host[SHARED_QUERY_CLIENT_SYMBOL];
+  delete host[SHARED_QUERY_CLIENT_RETAINERS_SYMBOL];
+  delete host[SHARED_QUERY_CLIENT_CONFIG_SYMBOL];
+  delete host[SHARED_QUERY_CLIENT_TEARDOWN_TOKEN_SYMBOL];
+  emitSharedQueryClientRuntimeChanged(false);
+}
+
+function isNonEmptyQueryCacheKey(queryKey: unknown): queryKey is QueryCacheKey {
+  return Array.isArray(queryKey) && queryKey.length > 0;
+}
+
+function isLocalBroadcast(queryClient: QueryClient, payload: unknown): boolean {
+  if (payload === null || typeof payload !== 'object') {
+    return false;
+  }
+
+  const candidate = payload as CacheEventBase;
+  return candidate.source === ensureQueryClientBroadcastTarget(queryClient);
+}
+
+function invalidateSharedFetchCache(
+  cache: SharedFetchCacheInvalidator | undefined,
+  filters: QueryCacheInvalidateFilters
+): void {
+  if (!cache) {
+    return;
+  }
+
+  if (filters.exact === false) {
+    cache.invalidateMany?.({
+      key: filters.queryKey,
+      exact: false,
+    });
+
+    if (!cache.invalidateMany) {
+      cache.clear();
+    }
+    return;
+  }
+
+  cache.invalidate(filters.queryKey);
+}
+
+function toScopedInvalidateFilters(payload: unknown): QueryCacheInvalidateFilters | null {
+  if (payload === null || typeof payload !== 'object') {
+    return null;
+  }
+
+  const candidate = payload as InvalidatePayloadInput;
+  if (!isNonEmptyQueryCacheKey(candidate.queryKey)) {
+    return null;
+  }
+
+  return {
+    queryKey: candidate.queryKey,
+    ...(candidate.exact === undefined ? {} : { exact: candidate.exact }),
+    ...(candidate.refetchType === undefined ? {} : { refetchType: candidate.refetchType }),
+  };
+}
+
+function toScopedCacheSetPayload(payload: unknown): CacheSetPayload | null {
+  if (payload === null || typeof payload !== 'object') {
+    return null;
+  }
+
+  const candidate = payload as CacheSetPayloadInput;
+  if (!isNonEmptyQueryCacheKey(candidate.queryKey)) {
+    return null;
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(candidate, 'dataOrUpdater')) {
+    return null;
+  }
+
+  return {
+    queryKey: candidate.queryKey,
+    dataOrUpdater: candidate.dataOrUpdater as QueryCacheUpdater<unknown>,
+    ...(typeof candidate.source === 'string' ? { source: candidate.source } : {}),
+  };
+}
+
+function toScopedCacheRemovePayload(payload: unknown): CacheRemovePayload | null {
+  if (payload === null || typeof payload !== 'object') {
+    return null;
+  }
+
+  const candidate = payload as CacheRemovePayloadInput;
+  if (!isNonEmptyQueryCacheKey(candidate.queryKey)) {
+    return null;
+  }
+
+  return {
+    queryKey: candidate.queryKey,
+    ...(typeof candidate.source === 'string' ? { source: candidate.source } : {}),
+  };
+}
+
+/**
+ * queryCache() plugin configuration.
+ */
+export interface QueryCacheConfig {
+  /**
+   * Time in ms before a query is considered stale and eligible for background refetch.
+   * @default 30_000
+   */
+  staleTime?: number;
+
+  /**
+   * Time in ms that unused/inactive query cache entries are kept in memory.
+   * @default 300_000
+   */
+  gcTime?: number;
+
+  /**
+   * Whether to refetch queries when the window regains focus.
+   * @default true
+   */
+  refetchOnWindowFocus?: boolean;
+}
+
+async function cancelQueriesForTeardown(queryClient: QueryClient): Promise<void> {
+  let cancelError: unknown;
+
+  try {
+    await queryClient.cancelQueries();
+  } catch (error: unknown) {
+    cancelError = error;
+  }
+
+  if (cancelError) {
+    throw cancelError;
+  }
+}
+
+type QueryTeardownCallbacks = {
+  onSettled?: () => void;
+  onFailure?: () => void;
+  onSuccess?: () => void;
+};
+
+function runQueryTeardown(
+  queryClient: QueryClient,
+  callbacks: QueryTeardownCallbacks,
+  failureMessage: string
+): void {
+  void cancelQueriesForTeardown(queryClient)
+    .then(() => {
+      callbacks.onSuccess?.();
+    })
+    .catch((error: unknown) => {
+      callbacks.onFailure?.();
+      console.error(failureMessage, error);
+    })
+    .finally(() => {
+      callbacks.onSettled?.();
+    });
+}
+
+function readStoreSlice(key: string): unknown {
+  const state: unknown = getStore().getState();
+  if (state === null || typeof state !== 'object' || !(key in state)) {
+    return undefined;
+  }
+  return (state as Record<string, unknown>)[key];
+}
+
+function readMockEnabled(): boolean {
+  const mockState = readStoreSlice('mock');
+  return (
+    mockState !== null &&
+    typeof mockState === 'object' &&
+    'enabled' in mockState &&
+    mockState.enabled === true
+  );
+}
+
+function readTenantId(): string | null {
+  const tenantState = readStoreSlice(TENANT_SLICE_NAME);
+  if (tenantState === null || typeof tenantState !== 'object' || !('tenant' in tenantState)) {
+    return null;
+  }
+
+  const tenant: unknown = tenantState.tenant;
+  return tenant !== null && typeof tenant === 'object' && 'id' in tenant && typeof tenant.id === 'string'
+    ? tenant.id
+    : null;
+}
+
+/**
+ * Drops the old scope's data synchronously, so nothing written after the
+ * change is wiped by a late clear. cancelQueries() aborts in-flight fetches at
+ * once (their results never land); its promise is not awaited. Each query is
+ * reset before clear() removes it: clear() alone does not notify observers, so
+ * a mounted screen would keep rendering the old scope's data. The reset tells
+ * them their data is gone, and on that re-render they build a fresh query and
+ * fetch under the new scope. The shared fetch cache aborts its pending entries
+ * on clear() as well.
+ */
+function clearForScopeChange(queryClient: QueryClient): void {
+  queryClient.cancelQueries().catch((error: unknown) => {
+    console.error('[Gears FrontX] Failed to cancel queries after a mock, tenant or session change', error);
+  });
+  queryClient.getQueryCache().getAll().forEach((query) => {
+    query.reset();
+  });
+  queryClient.clear();
+  peekSharedFetchCache()?.clear();
+}
+
+/**
+ * Mutations a session check stopped from writing. Their callbacks cannot roll
+ * back or refresh what they changed, such as an optimistic value, and a check
+ * that keeps the session clears nothing. So once every held mutation has
+ * settled, the cache refreshes, if a write of work started under the checked
+ * scope was dropped meanwhile (`recordQueryCacheScopeWriteDropped()`); with
+ * no such drop there is nothing to repair. It waits because a refetch while one still runs would
+ * read the server before it applied the mutation. A mutation started after
+ * the check is not waited for: its own callbacks still write, so it cleans up
+ * after itself as after any invalidation.
+ *
+ * Every read still running at the refresh may predate a held mutation, so the
+ * refresh cancels them all first; then the shared fetch cache drops its
+ * entries, queries without observers are removed, so their next use fetches,
+ * and the rest are invalidated, so active ones refetch.
+ *
+ * It does not wait for the identity check. A scope change, or a newer check
+ * that holds mutations, stops a refresh still waiting to cancel reads. A held
+ * mutation removed from the cache still reports its progress to it, so it is
+ * waited for like any other.
+ *
+ * Known limits: an observed `staleTime: 'static'` query (TanStack never
+ * refetches one) and a query whose observers are all disabled keep an
+ * optimistic value until they are next fetched; the wait has no bound, so a
+ * held mutation that stays pending (paused offline, or a request that never
+ * settles) delays the refresh; a cancelled read of a query with no data yet
+ * rejects its `fetchQuery()` or `ensureQueryData()` caller with a
+ * CancelledError.
+ */
+function createHeldBackMutations(queryClient: QueryClient): {
+  /** Holds the mutations running now; their callbacks write nothing from here on. */
+  hold(): void;
+  /** The cache scope changed, so nothing of theirs is left to refresh: let them go. */
+  release(): void;
+} {
+  const mutationCache = queryClient.getMutationCache();
+  const held = new Set<Mutation>();
+  let unwatch: (() => void) | null = null;
+  /** The generation the watch started at: a drop of work started under it or later is owed a refresh. */
+  let generationAtHold = 0;
+  /** A refresh is due: a write was dropped, and no refresh has run since. */
+  let owed = false;
+  /** Counts scope changes, so a refresh that spans one stops. */
+  let releases = 0;
+
+  const stopWatching = (): void => {
+    if (readLatestDroppedWriteGeneration(queryClient) >= generationAtHold) owed = true;
+    held.clear();
+    unwatch?.();
+    unwatch = null;
+  };
+
+  const refresh = async (): Promise<void> => {
+    const startedAt = releases;
+    // A cancel lands asynchronously; invalidating before it would reuse the cancelled fetch.
+    await queryClient.cancelQueries();
+    // A scope change in the meantime cleared the cache, so there is nothing left to refresh.
+    if (releases !== startedAt) return;
+    // A newer session check holds mutations: the refresh is still owed, once they settle.
+    if (held.size > 0) {
+      owed = true;
+      return;
+    }
+    peekSharedFetchCache()?.clear();
+    // Observers decide, not isActive(): a mounted query whose observers are disabled is not active,
+    // and removing it would leave those observers on a query the cache no longer updates.
+    queryClient.removeQueries({ predicate: (query) => query.getObserversCount() === 0 });
+    await queryClient.invalidateQueries();
+  };
+
+  const refreshIfSettled = (): void => {
+    held.forEach((mutation) => {
+      if (mutation.state.status !== 'pending') held.delete(mutation);
+    });
+    if (held.size > 0) return;
+    stopWatching();
+    if (!owed) return;
+    owed = false;
+    refresh().catch((error: unknown) => {
+      console.error('[Gears FrontX] Failed to refresh queries after a session check', error);
+    });
+  };
+
+  return {
+    hold() {
+      mutationCache.getAll().forEach((mutation) => {
+        if (mutation.state.status === 'pending') held.add(mutation);
+      });
+      if (held.size === 0 || unwatch) return;
+      generationAtHold = readQueryCacheScopeGeneration(queryClient);
+      unwatch = mutationCache.subscribe(refreshIfSettled);
+    },
+    release() {
+      releases += 1;
+      stopWatching();
+      owed = false;
+    },
+  };
+}
+
+/**
+ * Tracks the scope the cached data belongs to: mock mode, tenant and session.
+ * An event that repeats the scope already in force (every mock() runtime with
+ * enabledByDefault emits a toggle on init; a tenant change to the same tenant
+ * id) changes nothing. A real change, and every login or logout, clears the query
+ * cache and the shared fetch cache when a host queryCache() is present;
+ * otherwise the cache is marked stale and the next host to join clears it.
+ */
+function createCacheScopeTracking(queryClient: QueryClient): () => void {
+  const scope: CacheScopeState = {
+    mockEnabled: readMockEnabled(),
+    tenantId: readTenantId(),
+    stale: false,
+  };
+  cacheScopeByClient.set(queryClient, scope);
+  const heldBack = createHeldBackMutations(queryClient);
+
+  // The generation moves at the change itself, whether the cache is cleared
+  // now or only marked stale: work started before it belongs to the old
+  // scope either way. The deferred clear a joining host runs is no new scope,
+  // so it leaves the generation alone and work started after the change keeps
+  // writing.
+  const onScopeChanged = (): void => {
+    heldBack.release();
+    bumpQueryCacheScopeGeneration(queryClient);
+    if (hostClearEffectsByClient.has(queryClient)) {
+      clearForScopeChange(queryClient);
+    } else {
+      scope.stale = true;
+    }
+  };
+
+  const subscriptions = [
+    eventBus.on(MockEvents.Toggle, (payload) => {
+      if (payload.enabled === scope.mockEnabled) {
+        return;
+      }
+      scope.mockEnabled = payload.enabled;
+      onScopeChanged();
+    }),
+    eventBus.on(TenantEvents.Changed, (payload) => {
+      if (payload.tenant.id === scope.tenantId) {
+        return;
+      }
+      scope.tenantId = payload.tenant.id;
+      onScopeChanged();
+    }),
+    eventBus.on(TenantEvents.Cleared, () => {
+      if (scope.tenantId === null) {
+        return;
+      }
+      scope.tenantId = null;
+      onScopeChanged();
+    }),
+    eventBus.on(AuthEvents.LoggedOut, onScopeChanged),
+    eventBus.on(AuthEvents.LoggedIn, onScopeChanged),
+    // The session may be about to change: earlier work stops writing, nothing is cleared. The
+    // mutations it stopped get a refresh once they settle.
+    eventBus.on(AuthEvents.SessionCheck, () => {
+      heldBack.hold();
+      bumpQueryCacheScopeGeneration(queryClient);
+    }),
+  ];
+
+  return () => {
+    heldBack.release();
+    subscriptions.forEach((subscription) => {
+      subscription.unsubscribe();
+    });
+    cacheScopeByClient.delete(queryClient);
+  };
+}
+
+function createHostClearEffects(queryClient: QueryClient): () => void {
+  const scope = cacheScopeByClient.get(queryClient);
+  if (scope?.stale) {
+    scope.stale = false;
+    clearForScopeChange(queryClient);
+  }
+
+  return () => {};
+}
+
+function createCacheEffects(queryClient: QueryClient): () => void {
+  const releaseCacheScopeTracking = createCacheScopeTracking(queryClient);
+
+  const invalidateSub = eventBus.on('cache/invalidate', (payload: unknown) => {
+    const filters = toScopedInvalidateFilters(payload);
+    if (!filters) {
+      return;
+    }
+
+    if (!isLocalBroadcast(queryClient, payload)) {
+      void queryClient.invalidateQueries(filters);
+    }
+
+    invalidateSharedFetchCache(peekSharedFetchCache(), filters);
+  });
+
+  const setSub = eventBus.on('cache/set', (payload: unknown) => {
+    const cacheSetPayload = toScopedCacheSetPayload(payload);
+    if (!cacheSetPayload) {
+      return;
+    }
+
+    if (!isLocalBroadcast(queryClient, cacheSetPayload)) {
+      queryClient.setQueryData(cacheSetPayload.queryKey, cacheSetPayload.dataOrUpdater);
+    }
+
+    peekSharedFetchCache()?.invalidate(cacheSetPayload.queryKey);
+  });
+
+  const removeSub = eventBus.on('cache/remove', (payload: unknown) => {
+    const cacheRemovePayload = toScopedCacheRemovePayload(payload);
+    if (!cacheRemovePayload) {
+      return;
+    }
+
+    if (!isLocalBroadcast(queryClient, cacheRemovePayload)) {
+      queryClient.removeQueries({ queryKey: cacheRemovePayload.queryKey });
+    }
+
+    peekSharedFetchCache()?.invalidate(cacheRemovePayload.queryKey);
+  });
+
+  return () => {
+    invalidateSub.unsubscribe();
+    setSub.unsubscribe();
+    removeSub.unsubscribe();
+    releaseCacheScopeTracking();
+  };
+}
+
+function retainPerClientEffects(
+  entries: WeakMap<QueryClient, CacheEffectsEntry>,
+  queryClient: QueryClient,
+  create: (queryClient: QueryClient) => () => void
+): () => void {
+  let entry = entries.get(queryClient);
+  if (entry) {
+    entry.retainers += 1;
+  } else {
+    entry = {
+      retainers: 1,
+      cleanup: create(queryClient),
+      disposed: false,
+    };
+    entries.set(queryClient, entry);
+  }
+
+  const retained = entry;
+  return () => {
+    if (retained.disposed) {
+      return;
+    }
+
+    retained.retainers -= 1;
+    if (retained.retainers === 0) {
+      finalizeCacheEffectsEntry(entries, queryClient, retained);
+    }
+  };
+}
+
+function retainCacheEffects(queryClient: QueryClient): () => void {
+  return retainPerClientEffects(cacheEffectsByClient, queryClient, createCacheEffects);
+}
+
+function retainHostClearEffects(queryClient: QueryClient): () => void {
+  return retainPerClientEffects(hostClearEffectsByClient, queryClient, createHostClearEffects);
+}
+
+export function queryCache(config?: QueryCacheConfig): FrontXPlugin {
+  let queryClient: QueryClient | undefined;
+  let cleanup: (() => void) | null = null;
+  let sharedFetchCacheRetained = false;
+  let sharedRetainerReleased = false;
+
+  function releasePluginRetainer(): {
+    released: boolean;
+    isLastRetainer: boolean;
+    teardownToken: number;
+  } {
+    if (!queryClient || sharedRetainerReleased) {
+      return { released: false, isLastRetainer: false, teardownToken: 0 };
+    }
+
+    sharedRetainerReleased = true;
+    const release = releaseSharedQueryClient();
+    return {
+      released: release.released,
+      isLastRetainer: release.isLastRetainer,
+      teardownToken: release.teardownToken,
+    };
+  }
+
+  function releasePluginSharedFetchCacheRetainer(): void {
+    if (!sharedFetchCacheRetained) {
+      return;
+    }
+
+    sharedFetchCacheRetained = false;
+    releaseSharedFetchCache();
+  }
+
+  const plugin: QueryCachePlugin = {
+    name: 'queryCache',
+    [DUPLICATE_PLUGIN_CLEANUP_SYMBOL]() {
+      const { released } = releasePluginRetainer();
+      if (!released) {
+        return;
+      }
+
+      releasePluginSharedFetchCacheRetainer();
+    },
+    onInit(app) {
+      if (!queryClient) {
+        queryClient = retainSharedQueryClient(config);
+        retainSharedFetchCache();
+        sharedFetchCacheRetained = true;
+        const releaseCacheEffects = retainCacheEffects(queryClient);
+        const releaseHostClearEffects = retainHostClearEffects(queryClient);
+        cleanup = () => {
+          releaseHostClearEffects();
+          releaseCacheEffects();
+        };
+      }
+      attachQueryClientToApp(app, queryClient);
+    },
+    onDestroy(app) {
+      if (queryClient) {
+        detachQueryClientFromApp(app, queryClient);
+      }
+      if (cleanup) {
+        cleanup();
+        cleanup = null;
+      }
+      const { released, isLastRetainer, teardownToken } = releasePluginRetainer();
+      if (!released) {
+        return;
+      }
+      const sharedQueryClient = queryClient;
+      if (!sharedQueryClient) {
+        return;
+      }
+      const isLastSharedRetainer = isLastRetainer;
+      if (isLastSharedRetainer) {
+        runQueryTeardown(
+          sharedQueryClient,
+          {
+            onSettled: () => {
+              finalizeReleasedSharedQueryClient(sharedQueryClient, teardownToken);
+              releasePluginSharedFetchCacheRetainer();
+            },
+          },
+          '[Gears FrontX] Failed to destroy query cache runtime'
+        );
+        return;
+      }
+
+      releasePluginSharedFetchCacheRetainer();
+    },
+  };
+
+  return plugin;
+}
+
+export function queryCacheShared(): FrontXPlugin {
+  let queryClient: QueryClient | undefined;
+  let cleanup: (() => void) | null = null;
+  let sharedFetchCacheRetained = false;
+  let sharedRetainerReleased = false;
+
+  function ensureSharedQueryClient(app: FrontXApp): QueryClient | undefined {
+    if (queryClient) {
+      attachQueryClientToApp(app, queryClient);
+      return queryClient;
+    }
+
+    if (!peekSharedQueryClient()) {
+      return undefined;
+    }
+
+    queryClient = retainExistingSharedQueryClient();
+    attachQueryClientToApp(app, queryClient);
+
+    if (!sharedFetchCacheRetained) {
+      retainSharedFetchCache();
+      sharedFetchCacheRetained = true;
+    }
+
+    cleanup = retainCacheEffects(queryClient);
+    return queryClient;
+  }
+
+function releasePluginRetainer(): { released: boolean; isLastRetainer: boolean; teardownToken: number } {
+    if (!queryClient || sharedRetainerReleased) {
+      return { released: false, isLastRetainer: false, teardownToken: 0 };
+    }
+
+    sharedRetainerReleased = true;
+    const release = releaseSharedQueryClient();
+    return {
+      released: release.released,
+      isLastRetainer: release.isLastRetainer,
+      teardownToken: release.teardownToken,
+    };
+  }
+
+  function releasePluginSharedFetchCacheRetainer(): void {
+    if (!sharedFetchCacheRetained) {
+      return;
+    }
+
+    sharedFetchCacheRetained = false;
+    releaseSharedFetchCache();
+  }
+
+  const plugin: QueryCachePlugin = {
+    name: 'queryCacheShared',
+    [DUPLICATE_PLUGIN_CLEANUP_SYMBOL]() {
+      const { released } = releasePluginRetainer();
+      if (!released) {
+        return;
+      }
+
+      releasePluginSharedFetchCacheRetainer();
+    },
+    onInit(app) {
+      attachQueryClientResolverToApp(app, () => (app as QueryClientApp)[APP_QUERY_CLIENT_SYMBOL]);
+      attachQueryClientActivatorToApp(app, () => ensureSharedQueryClient(app));
+      ensureSharedQueryClient(app);
+    },
+    onDestroy(app) {
+      detachQueryClientResolverFromApp(app);
+      detachQueryClientActivatorFromApp(app);
+      if (queryClient) {
+        detachQueryClientFromApp(app, queryClient);
+      }
+      if (cleanup) {
+        cleanup();
+        cleanup = null;
+      }
+      const { released, isLastRetainer, teardownToken } = releasePluginRetainer();
+      if (!released) {
+        return;
+      }
+      const isLastSharedRetainer = isLastRetainer;
+      if (isLastSharedRetainer) {
+        const sharedQueryClient = queryClient;
+        if (!sharedQueryClient) {
+          return;
+        }
+        runQueryTeardown(
+          sharedQueryClient,
+          {
+            onSettled: () => {
+              finalizeReleasedSharedQueryClient(sharedQueryClient, teardownToken);
+              releasePluginSharedFetchCacheRetainer();
+            },
+          },
+          '[Gears FrontX] Failed to destroy shared query cache runtime'
+        );
+        return;
+      }
+
+      releasePluginSharedFetchCacheRetainer();
+    },
+  };
+
+  return plugin;
+}

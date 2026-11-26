@@ -1,0 +1,554 @@
+/*
+ * The Home page. Phone first: every base rule is the 390 px layout; wider
+ * layouts are added with min-width queries (768 px tablet, 1200 px desktop).
+ *
+ * The screen draws its bands edge to edge, so it opts out of the shell's
+ * inline padding; the content column carries its own gutters (20 px on a
+ * phone, 68 px from 1200 px up).
+ */
+:host {
+  --frontx-screen-inline-padding: 0;
+}
+
+.screen {
+  min-height: 100%;
+}
+
+/*
+ * The app's palette mapped onto the kit roles the page's components read:
+ * white page, navy text, muted grey-blue copy, one blue accent, light lines.
+ */
+.page {
+  --background: var(--app-page);
+  --foreground: var(--app-navy);
+  --card: var(--app-page);
+  --card-foreground: var(--app-navy);
+  --popover-foreground: var(--app-navy);
+  --muted-foreground: var(--app-muted);
+  --border: var(--app-line);
+  --primary: var(--app-accent);
+  --primary-hover: var(--app-accent-hover);
+  --primary-ring: var(--app-accent-hover);
+  --ring: var(--app-accent);
+  --accent: var(--app-accent);
+
+  --gutter: var(--app-gutter-phone);
+  --section-gap: var(--space-14);
+  --head-gap: var(--space-8);
+  --item-gap: var(--space-4);
+
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+  background-color: var(--app-page);
+  color: var(--app-navy);
+}
+
+.nowrap {
+  white-space: nowrap;
+}
+
+.arrow {
+  display: inline-block;
+  width: var(--icon-size-sm);
+  height: var(--icon-size-sm);
+  margin-left: var(--space-1);
+  vertical-align: -0.125em;
+}
+
+/* ---------- Shared type ---------- */
+
+.sectionTitle {
+  margin: 0;
+  color: var(--app-navy);
+  font-size: var(--text-section-phone-size);
+  font-weight: 600;
+  line-height: var(--text-section-phone-line-height);
+  letter-spacing: var(--app-tracking-tight);
+}
+
+.sectionLead {
+  margin: 0;
+  color: var(--app-muted);
+  font-size: var(--text-lead-size);
+  line-height: var(--text-lead-line-height);
+}
+
+.cardTitle {
+  margin: 0;
+  color: var(--app-navy);
+  font-size: var(--text-card-title-size);
+  font-weight: 700;
+  line-height: var(--text-card-title-line-height);
+}
+
+.itemTitle {
+  margin: 0;
+  color: var(--app-navy);
+  font-size: var(--text-item-size);
+  font-weight: 600;
+  line-height: var(--text-item-line-height);
+}
+
+.body {
+  margin: 0;
+  color: var(--app-muted);
+  font-size: var(--text-copy-size);
+  line-height: var(--text-copy-line-height);
+}
+
+.eyebrow {
+  margin: 0;
+  color: var(--app-accent);
+  font-size: var(--text-label-size);
+  font-weight: 600;
+  line-height: var(--text-label-line-height);
+}
+
+.heroLine {
+  display: block;
+}
+
+.accentLink,
+.darkLink {
+  align-self: flex-start;
+  font-size: var(--text-nav-size);
+  font-weight: 600;
+  line-height: var(--text-label-line-height);
+  text-decoration: none;
+}
+
+.accentLink {
+  color: var(--app-accent);
+}
+
+.darkLink {
+  color: var(--app-navy);
+}
+
+.accentLink:hover,
+.darkLink:hover {
+  color: var(--app-accent-hover);
+  text-decoration: none;
+}
+
+/* ---------- Buttons drawn on links ---------- */
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-6);
+}
+
+.actions .cta {
+  height: var(--control-height-xl);
+  padding: 0 var(--space-6);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-copy-size);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.actions .ctaOnBlue {
+  --button-bg: var(--app-on-accent);
+  --button-fg: var(--app-accent);
+  --button-bg-hover: var(--app-tint);
+  --button-fg-hover: var(--app-accent-hover);
+  --button-focus-ring: var(--app-on-accent);
+}
+
+.actions .ctaOnDark {
+  --button-bg: var(--app-accent);
+  --button-fg: var(--app-on-accent);
+  --button-bg-hover: var(--app-accent-hover);
+  --button-fg-hover: var(--app-on-accent);
+  --button-focus-ring: var(--app-on-accent);
+}
+
+/* ---------- A. Hero band ---------- */
+
+.hero {
+  background-color: var(--app-accent);
+  color: var(--app-on-accent);
+}
+
+.heroInner {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-8);
+  padding: var(--space-14) var(--gutter);
+}
+
+.heroTitle {
+  margin: 0;
+  color: var(--app-on-accent);
+  font-size: var(--text-hero-phone-size);
+  font-weight: var(--text-hero-weight);
+  line-height: var(--text-hero-phone-line-height);
+  letter-spacing: var(--app-tracking-tight);
+}
+
+.heroAside {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+}
+
+.heroLead {
+  margin: 0;
+  color: var(--app-on-accent);
+  font-size: var(--text-hero-lead-size);
+  line-height: var(--text-hero-lead-line-height);
+}
+
+.heroLink,
+.closingLink {
+  font-size: var(--text-copy-size);
+  font-weight: 600;
+  line-height: var(--text-copy-line-height);
+  text-decoration: none;
+}
+
+.heroLink {
+  color: var(--app-on-accent);
+}
+
+.closingLink {
+  color: var(--app-on-dark-muted);
+}
+
+.heroLink:hover,
+.closingLink:hover {
+  color: var(--app-on-accent);
+  text-decoration: none;
+}
+
+.heroLink:focus-visible,
+.closingLink:focus-visible,
+.step:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: var(--space-1);
+  border-radius: var(--radius-xs);
+}
+
+/* ---------- Content column and sections ---------- */
+
+.column {
+  display: flex;
+  flex-direction: column;
+  gap: var(--section-gap);
+  padding: var(--section-gap) var(--gutter);
+}
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--head-gap);
+  min-width: 0;
+}
+
+.sectionHead {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+/* ---------- B. Feature cards ---------- */
+
+.featureStack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--item-gap);
+}
+
+.featureGrid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--item-gap);
+}
+
+.featureCard,
+.wideCard {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+  padding: var(--app-card-pad);
+  border-radius: var(--radius-lg);
+}
+
+.featureCard {
+  border: 1px solid var(--app-line);
+  background-color: var(--app-page);
+}
+
+.wideCard {
+  background-color: var(--app-tint);
+}
+
+.picture {
+  display: flex;
+  align-items: center;
+  height: var(--app-picture-height);
+}
+
+.pictureFigure {
+  width: var(--app-picture-width);
+}
+
+.featureText {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.featureLine {
+  margin: 0;
+  color: var(--app-navy);
+  font-size: var(--text-item-size);
+  font-weight: 500;
+  line-height: var(--text-item-line-height);
+}
+
+.points {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.point {
+  position: relative;
+  padding-left: var(--space-4);
+  color: var(--app-muted);
+  font-size: var(--text-copy-size);
+  line-height: var(--text-copy-line-height);
+}
+
+/* The small blue dot that starts each line, centred on its first line. */
+.point::before {
+  content: '';
+  position: absolute;
+  top: calc((var(--text-copy-line-height) - var(--space-1) * 1.5) / 2);
+  left: 0;
+  width: calc(var(--space-1) * 1.5);
+  height: calc(var(--space-1) * 1.5);
+  border-radius: var(--radius-full);
+  background-color: var(--app-accent);
+}
+
+/* ---------- C. Groundwork ---------- */
+
+.groundwork {
+  padding-bottom: var(--section-gap);
+  border-bottom: 1px solid var(--app-line);
+}
+
+.groundworkGrid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-10);
+}
+
+.groundworkItem {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.groundworkItem .body {
+  max-width: var(--app-measure);
+}
+
+/* ---------- D. UI Kit ---------- */
+
+.splitHead {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+}
+
+.splitHeadMain,
+.splitHeadAside {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.example {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.builtWith {
+  margin: 0;
+  color: var(--app-muted);
+  font-size: var(--text-label-size);
+  line-height: var(--text-label-line-height);
+}
+
+/* ---------- E. First change ---------- */
+
+.firstChange {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--head-gap);
+}
+
+.firstIntro {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.steps {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border-top: 1px solid var(--app-line);
+}
+
+.stepItem {
+  border-bottom: 1px solid var(--app-line);
+}
+
+.step {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-6) 0;
+  color: var(--app-navy);
+  text-decoration: none;
+}
+
+.stepText {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.stepArrow {
+  flex-shrink: 0;
+  width: var(--icon-size-md);
+  height: var(--icon-size-md);
+  color: var(--app-navy);
+}
+
+.step:hover .stepArrow,
+.step:hover .itemTitle {
+  color: var(--app-accent);
+}
+
+/* ---------- F. Closing band ---------- */
+
+.closing {
+  margin-top: auto;
+  background-color: var(--app-band-dark);
+}
+
+.closingInner {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-8);
+  padding: var(--space-14) var(--gutter);
+}
+
+.closingTitle {
+  margin: 0;
+  color: var(--app-on-accent);
+  font-size: var(--text-section-phone-size);
+  font-weight: 600;
+  line-height: var(--text-section-phone-line-height);
+  letter-spacing: var(--app-tracking-tight);
+}
+
+/* ---------- Tablet ---------- */
+
+@media (min-width: 768px) {
+  .page {
+    --gutter: var(--space-10);
+    --section-gap: var(--space-24);
+    --head-gap: var(--space-12);
+    --item-gap: var(--space-6);
+  }
+
+  .heroInner {
+    padding: var(--space-16) var(--gutter);
+  }
+
+  .heroTitle {
+    font-size: var(--text-hero-size);
+    line-height: var(--text-hero-line-height);
+  }
+
+  .sectionTitle {
+    font-size: var(--text-section-size);
+    line-height: var(--text-section-line-height);
+  }
+
+  .closingTitle {
+    font-size: var(--text-closing-size);
+    line-height: var(--text-closing-line-height);
+  }
+
+  .featureGrid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .groundworkGrid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: var(--space-15);
+  }
+}
+
+/* ---------- Desktop ---------- */
+
+@media (min-width: 1200px) {
+  .page {
+    --gutter: var(--app-gutter);
+  }
+
+  .heroInner {
+    flex-direction: row;
+    align-items: flex-start;
+    justify-content: space-between;
+  }
+
+  .heroAside {
+    flex: 0 0 var(--app-hero-aside);
+    width: var(--app-hero-aside);
+  }
+
+  .featureGrid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .wideCard {
+    display: grid;
+    grid-template-columns: var(--app-picture-wide) minmax(0, 1fr) minmax(0, 1fr);
+    align-items: center;
+    gap: var(--space-12);
+  }
+
+  .wideCard .pictureFigure {
+    width: var(--app-picture-wide);
+  }
+
+  .splitHead {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    align-items: end;
+    gap: var(--space-15);
+  }
+
+  .firstChange {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: var(--space-15);
+  }
+}

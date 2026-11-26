@@ -1,0 +1,44 @@
+.popup {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.backdrop {
+  position: absolute;
+  inset: 0;
+  background-color: color-mix(in oklab, var(--background) 80%, transparent);
+  backdrop-filter: blur(4px);
+}
+
+/* z-index is 1000 + stack depth * 10; only the top popup renders. */
+.dialog {
+  position: relative;
+  z-index: 1001;
+  width: 100%;
+  max-width: 32rem;
+  padding: var(--space-6);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background-color: var(--background);
+  /* The shell's popover elevation, declared per theme in src-app/app/themes
+     and for the --uikit none build in src-app/app/themes/none-build.css.
+     The kit's --popover-shadow and --panel-shadow draw different shadows. */
+  box-shadow: var(--shadow-popover);
+}
+
+.header {
+  margin-bottom: var(--space-4);
+}
+
+.title {
+  /* The kit's heading-1 step, one step larger than the 1.125rem body size
+     the title falls back to in the no-kit build. That build takes its values
+     from src-app/app/themes/none-build.css. */
+  font-size: var(--text-heading-1-size);
+  line-height: var(--text-heading-1-line-height);
+  font-weight: var(--text-heading-1-weight);
+}

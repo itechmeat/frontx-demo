@@ -1,0 +1,120 @@
+# Guideline: How an MFE Contributes to Navigation
+
+An MFE package appears in the host's menu by declaring a *screen extension* in
+its own `mfe.json` — there is no central menu list to edit, no shell code to
+touch, and no registration call to make. This guideline is a code-verified
+snapshot of the producer side of that contract; the consumer side (how the
+shell discovers, validates, and renders these declarations) is the
+`navigation-composition` guideline in the `template-shell` AI bundle. If the
+declarations in this template's packages change shape, this file must be
+updated to match.
+
+## The whole contract for "appear in the menu"
+
+One entry in the package's `mfe.json` `extensions[]` array, targeting the
+shared screen domain — verbatim from `demo-mfe`:
+
+```json
+{
+  "id": "gts.frontx.mfes.ext.extension.v1~frontx.screensets.layout.screen.v1~frontx.widgets.host.screen.v1",
+  "domain": "gts.frontx.mfes.ext.domain.v1~frontx.screensets.layout.screen.v1",
+  "entry": "gts.frontx.mfes.mfe.entry.v1~frontx.mfes.mfe.entry_mf.v1~frontx.demo.mfe.widgets_host.v1",
+  "route": "/widgets-host",
+  "presentation": {
+    "label": "Widgets Host",
+    "icon": "lucide:layout-grid",
+    "order": 200
+  }
+}
+```
+
+- `id` — this extension's own identity, derived from the screen extension
+  type. Author the instance segment per the `gts-id-conventions` guideline in
+  this bundle.
+- `domain` — always the fixed shared screen domain for menu entries; never a
+  domain you invent.
+- `entry` — must reference an entry declared in the same package's
+  `entries[]`, whose `exposedModule` names the lifecycle module your
+  `vite.config.ts` exposes through Module Federation.
+
+## `route` and `presentation` semantics
+
+The screen domain pins a derived extension type that **requires** the
+extension's top-level `route` and its `presentation` — the host validates every screen-domain extension against it
+at registration and rejects mismatches outright (your screen will not appear,
+with a thrown registration error, not a silent skip):
+
+| Field (on the extension) | Required | Meaning |
+|---|---|---|
+| `label` | yes | fallback menu item text and tooltip when the current language has no dictionary label |
+| `route` (top level, beside `id`/`domain`/`entry`) | yes | route value (e.g. `/widgets-host`) the FrontX router finds the extension by; with the screen domain's own route it gives the extension its private subroute - keep it unique within the domain and stable across releases. It must reduce to one valid name under the naming rule of `@gears-frontx/routing`; otherwise the router refuses the registration. The screen opens at `/?screen=<route without its leading slash>` (e.g. `/?screen=widgets-host`); the pathname selects no screen. Under the default router (the engine provider `@gears-frontx/routing-tanstack`) an in-screen sub-route is written into the same `screen` entry of the query, `/?screen=<token>;route=<in-screen pathname without its leading slash>`: the detail of task TSK-128 under the in-screen route `/<id>` is `/?screen=tasks;route=TSK-128`, written with pushState, so Back and deep links work |
+| `icon` | no | Iconify name with prefix (e.g. `lucide:user`); omitted = no icon |
+| `order` | no | sort key across the whole menu, lower = earlier; omitted = `999` (last) |
+
+`order` is a flat number per domain — there is no grouping or nesting, so
+coordinate values across packages if relative position matters.
+
+`label` is the English menu label. To translate it, declare one dictionary per language at the top of `mfe.json`, for example `"labelDictionaries": [{ "language": "de", "file": "labels/de.json" }]`. The file lives in `public/labels/`, relative to this MFE's served root. It contains one language's labels for this MFE:
+
+```json
+{
+  "type": "gts.frontx.i18n.dict.screen_labels.v1~",
+  "language": "de",
+  "labels": [{ "extension": "gts.frontx.mfes.ext.extension.v1~frontx.screensets.layout.screen.v1~frontx.widgets.host.screen.v1", "label": "Widget-Host" }]
+}
+```
+
+List the screen extensions you translate; the build does not require every one. The shell validates the file against `gts.frontx.i18n.dict.screen_labels.v1~` and uses its label for menu text and tooltip. A screen missing from the dictionary, and every screen in a language with no dictionary, shows `presentation.label`. When you rename a screen in `presentation.label`, update its translations too.
+
+## Routes inside the MFE
+
+An extension that declares a `route`, in a domain that declares one too, has
+a private subroute of its own, and the MFE reads and changes only that. An MFE
+with routes renders `<ExtensionRouter routeTree={routeTree} />` from
+`@gears-frontx/routing-tanstack` in its own content, building `routeTree` with
+the route-tree builders that package re-exports; code outside the rendered
+tree (an `ActionHandler`, for instance) calls `navigation()` from the same
+package (`navigate(path)`, `replace(path)`, `location()`). The framework adds
+nothing to this: it only passes the FrontX router to the registry it builds.
+Everything outside the private subroute, including which extension a domain
+shows, changes through actions (`mount_ext`, `unmount_ext`), never through
+navigation. An extension without a `route` of its own, or mounted into a
+domain without one, has no router access: `ExtensionRouter` and `navigation()`
+refuse with an error there.
+
+Every MFE lists `@gears-frontx/routing` in its shared dependencies in
+`vite.config.ts`, so its runtime evaluates one copy of it, never shared across
+MFEs. An MFE that renders `<ExtensionRouter>` or calls `navigation()` lists
+`@gears-frontx/routing-tanstack` there too.
+
+An MFE is tested inside a shell — a simple dummy shell, for instance the template shell via `npm run dev:all`; it has no standalone preview.
+
+## Beyond the menu: extensions that do not target the screen domain
+
+A package may also *own* a domain (declared in its `mfe.json` `domains[]`) and
+accept extensions from other packages into it. In this template, `demo-mfe`
+owns the widgets domain (`…ext.domain.v1~frontx.widgets.area.main.v1`), and
+`widgets-fixture-a` / `widgets-fixture-b` declare extensions targeting it —
+without any `presentation`, since they render inside the Widgets Host screen,
+not in the menu. The host deliberately skips extensions whose domain it does
+not own and delivers them to the owning runtime: composition is recursive, and
+"my screen hosts contributions from other packages" needs no shell
+involvement.
+
+## Where declarations travel
+
+`mfe.json` is read at build time by the shell's `frontxMfGts()` plugin, merged
+into `dist/mfe-manifest.json`, aggregated into
+`public/generated-mfe-manifests.json`, and registered by the host at runtime.
+Nothing else reads it — a change to `mfe.json` takes effect after the package
+is rebuilt and manifests are regenerated (`npm run generate:mfe-manifests`, or
+any script that runs it, e.g. `dev:all`).
+
+## Boundaries
+
+- The full directory/build shape a package must satisfy to be discovered at
+  all — `package.json` port flag, `vite.config.ts` plugin order, build
+  outputs — is the shell's `mfe-package-contract` guideline.
+- ID authoring rules for every field above are this bundle's
+  `gts-id-conventions` guideline; the `add-mfe-package` skill walks the whole
+  flow.

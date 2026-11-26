@@ -1,0 +1,165 @@
+/*
+ * Screen-local layout for the profile screen and the card it composes.
+ *
+ * Colour, spacing and type resolve through @gears-frontx/ui-kit tokens, which
+ * KitThemedLifecycle re-anchors onto this shadow root's host.
+ */
+
+.screen {
+  background-color: var(--background);
+  color: var(--foreground);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+  /*
+   * Keeps the screen root as tall as the host, so the loading frame below the
+   * header covers the slot instead of collapsing to the skeleton and growing
+   * when the dictionary lands.
+   */
+  min-height: 100%;
+  padding: var(--space-4) 0;
+}
+
+/* On a phone the shell's own 1rem side padding is the screen's margin. */
+@media (min-width: 40rem) {
+  .screen {
+    padding: var(--space-8);
+  }
+}
+
+.intro {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.title {
+  font-size: var(--text-heading-1-size);
+  font-weight: var(--text-heading-1-weight);
+  letter-spacing: var(--text-heading-1-tracking);
+  line-height: var(--text-heading-1-line-height);
+}
+
+.description {
+  color: var(--muted-foreground);
+  font-size: var(--text-body-size);
+  line-height: var(--text-body-line-height);
+}
+
+/* The profile is a reading column, not a full-width table. */
+.column {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  max-width: 42rem;
+}
+
+/*
+ * The heading element exists for the document outline — the kit's CardTitle
+ * renders a plain div and contributes nothing to it — so its type comes from
+ * the CardTitle it sits in, and this rule only has to stop the UA stylesheet's
+ * own h2 size and margins from overriding what it inherits.
+ */
+.sectionTitle {
+  font: inherit;
+  margin: 0;
+}
+
+.definitions {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.term {
+  font-size: var(--text-label-size);
+  font-weight: var(--text-label-weight);
+}
+
+.value {
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: var(--text-mono-size);
+  line-height: var(--text-mono-line-height);
+  /* A GTS id has no break opportunity; this wraps it instead of widening the screen. */
+  word-break: break-all;
+}
+
+.identity {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+/*
+ * Sized onto the kit Avatar root: the kit owns the round clipping and the
+ * image's object-fit, so only the width and height of the old <img> survive
+ * here. The loading-state placeholderAvatar below reserves the same box.
+ */
+.avatar {
+  height: 5rem;
+  width: 5rem;
+}
+
+.name {
+  font-size: var(--text-heading-2-size);
+  font-weight: var(--text-heading-2-weight);
+  letter-spacing: var(--text-heading-2-tracking);
+  line-height: var(--text-heading-2-line-height);
+  margin: 0;
+}
+
+.email {
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: var(--text-mono-size);
+}
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.error {
+  color: var(--destructive);
+  font-size: var(--text-body-size);
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.placeholders {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+/*
+ * Kit Skeleton bakes in no dimension by design — the consumer sizes each
+ * instance. These shape the placeholder roughly like the content it stands in
+ * for, so the literals are silhouettes of that content rather than values a
+ * token could carry: there is no kit token for "as wide as a heading".
+ */
+.placeholderTitle {
+  height: var(--control-height-lg);
+  max-width: 100%;
+  width: 16rem;
+}
+
+.placeholderLine {
+  height: var(--space-4);
+}
+
+.placeholderLineShort {
+  height: var(--space-4);
+  width: 75%;
+}
+
+.placeholderAvatar {
+  border-radius: 999px;
+  height: 5rem;
+  width: 5rem;
+}

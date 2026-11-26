@@ -1,0 +1,1149 @@
+/**
+ * Integration tests for useApiMutation and QueryCache methods.
+ *
+ * Covers:
+ *   - useApiMutation: accepts { endpoint, callbacks }, returns ApiMutationResult
+ *   - QueryCache: methods accept EndpointDescriptor | QueryKey via resolveKey
+ *   - createQueryCache.invalidateMany: skips empty keys, invalidates present keys
+ *   - Cross-root cache sync: set/invalidate/remove broadcast into sibling providers
+ *
+ * @packageDocumentation
+ */
+
+import { describe, it, expect, vi, afterEach, beforeEach, onTestFinished } from 'vitest';
+import { act, renderHook, waitFor } from '@testing-library/react';
+import type { MutationCallbackContext } from '../src/hooks/QueryCache';
+import {
+  loadFreshHelpers,
+  ownedApps,
+  buildTestQueryClient,
+  buildMutationCacheTestQueryClient,
+  makeQueryWrapper,
+  makeMutationDescriptor,
+  makeQueryDescriptor,
+  buildPresetApp,
+  getAttachedQueryClient,
+  buildHostAppWithQueryCache,
+  buildAppWithQueryClient,
+  buildAppInOtherRuntime,
+} from './queryHooks.helpers';
+
+// Each test loads a fresh module copy: a runtime builds one app.
+let eventBus: typeof import('@gears-frontx/framework')['eventBus'];
+let AuthEvents: typeof import('@gears-frontx/framework')['AuthEvents'];
+let TenantEvents: typeof import('@gears-frontx/framework')['TenantEvents'];
+let FrontXProvider: typeof import('@gears-frontx/react')['FrontXProvider'];
+let resetSharedFetchCache: typeof import('@gears-frontx/framework')['resetSharedFetchCache'];
+let resetSharedQueryClient: typeof import('@gears-frontx/framework')['resetSharedQueryClient'];
+let useApiMutation: typeof import('../src/hooks/useApiMutation')['useApiMutation'];
+let createQueryCache: typeof import('../src/hooks/QueryCache')['createQueryCache'];
+
+beforeEach(async () => {
+  vi.resetModules();
+  await loadFreshHelpers();
+  ({ eventBus, AuthEvents, TenantEvents, resetSharedFetchCache, resetSharedQueryClient } =
+    await import('@gears-frontx/framework'));
+  ({ FrontXProvider } = await import('@gears-frontx/react'));
+  ({ useApiMutation } = await import('../src/hooks/useApiMutation'));
+  ({ createQueryCache } = await import('../src/hooks/QueryCache'));
+});
+
+afterEach(() => {
+  ownedApps.forEach((app) => {
+    app.destroy();
+  });
+  ownedApps.length = 0;
+  eventBus.clearAll();
+  resetSharedFetchCache();
+  resetSharedQueryClient();
+});
+
+// ============================================================================
+// useApiMutation
+// ============================================================================
+
+describe('useApiMutation', () => {
+  it('calls endpoint.fetch with the variables passed to mutate()', async () => {
+    const client = buildTestQueryClient();
+    const wrapper = makeQueryWrapper(client);
+
+    const fetchFn = vi.fn(async (vars: { name: string }) => vars.name);
+    const endpoint = makeMutationDescriptor<string, { name: string }>(
+      ['updateName'],
+      fetchFn
+    );
+
+    const { result } = renderHook(
+      () => useApiMutation<string, Error, { name: string }>({ endpoint }),
+      { wrapper }
+    );
+
+    result.current.mutate({ name: 'test' });
+
+    await waitFor(() => expect(result.current.data).toBe('test'));
+    expect(fetchFn).toHaveBeenCalledOnce();
+    expect(fetchFn).toHaveBeenCalledWith(
+      { name: 'test' },
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    );
+    expect(result.current.isPending).toBe(false);
+  });
+
+  it('calls onSuccess callback with { queryCache } injected as final argument', async () => {
+    const client = buildTestQueryClient();
+    const wrapper = makeQueryWrapper(client);
+
+    const onSuccess = vi.fn();
+    const endpoint = makeMutationDescriptor<string, string>(
+      ['toUpper'],
+      async (value) => value.toUpperCase()
+    );
+
+    const { result } = renderHook(
+      () =>
+        useApiMutation<string, Error, string>({
+          endpoint,
+          onSuccess,
+        }),
+      { wrapper }
+    );
+
+    result.current.mutate('hello');
+
+    await waitFor(() => expect(result.current.data).toBe('HELLO'));
+    expect(onSuccess).toHaveBeenCalledOnce();
+    // Verify the injected { queryCache } context is the final argument
+    const [data, variables, context, callbackCtx] = onSuccess.mock.calls[0] as [string, string, unknown, MutationCallbackContext];
+    expect(data).toBe('HELLO');
+    expect(variables).toBe('hello');
+    expect(context).toBeUndefined();
+    expect(callbackCtx).toHaveProperty('queryCache');
+    expect(typeof callbackCtx.queryCache.get).toBe('function');
+    expect(typeof callbackCtx.queryCache.set).toBe('function');
+    expect(typeof callbackCtx.queryCache.invalidate).toBe('function');
+    expect(typeof callbackCtx.queryCache.cancel).toBe('function');
+    expect(typeof callbackCtx.queryCache.remove).toBe('function');
+  });
+
+  it('queryCache.get and queryCache.set read and write to the QueryClient cache', async () => {
+    const client = buildMutationCacheTestQueryClient();
+    const wrapper = makeQueryWrapper(client);
+
+    const QUERY_KEY = ['@test', 'item'];
+    // Seed an initial cache entry before the mutation runs.
+    client.setQueryData(QUERY_KEY, { count: 0 });
+
+    let capturedGet: unknown;
+    let capturedSet: unknown;
+
+    const endpoint = makeMutationDescriptor<void, void>(['noop'], async () => undefined);
+
+    const { result } = renderHook(
+      () =>
+        useApiMutation<void, Error, void>({
+          endpoint,
+          onMutate: async (_variables, { queryCache }) => {
+            // Read the seeded value via queryCache.get (raw QueryKey)
+            capturedGet = queryCache.get<{ count: number }>(QUERY_KEY);
+            // Write an optimistic update via queryCache.set (plain value)
+            queryCache.set(QUERY_KEY, { count: 99 });
+            capturedSet = queryCache.get<{ count: number }>(QUERY_KEY);
+          },
+        }),
+      { wrapper }
+    );
+
+    result.current.mutate();
+
+    await waitFor(() => expect(result.current.data).toBeUndefined());
+    await waitFor(() => expect(result.current.isPending).toBe(false));
+
+    // get() returned the seeded value
+    expect(capturedGet).toEqual({ count: 0 });
+    // set() wrote the optimistic value and get() reflects it immediately
+    expect(capturedSet).toEqual({ count: 99 });
+    // The underlying QueryClient also holds the updated value
+    expect(client.getQueryData(QUERY_KEY)).toEqual({ count: 99 });
+  });
+
+  it('queryCache methods accept EndpointDescriptor in place of raw QueryKey', async () => {
+    const client = buildMutationCacheTestQueryClient();
+    const wrapper = makeQueryWrapper(client);
+
+    const QUERY_KEY = ['@test', 'descriptor-key-test'] as const;
+    const queryDescriptor = makeQueryDescriptor(QUERY_KEY, () => Promise.resolve({ v: 1 }));
+
+    client.setQueryData([...QUERY_KEY], { v: 0 });
+
+    let capturedViaDescriptor: unknown;
+
+    const mutationEndpoint = makeMutationDescriptor<void, void>(['noop2'], async () => undefined);
+
+    const { result } = renderHook(
+      () =>
+        useApiMutation<void, Error, void>({
+          endpoint: mutationEndpoint,
+          onMutate: async (_vars, { queryCache }) => {
+            // Pass EndpointDescriptor — resolveKey extracts .key automatically
+            capturedViaDescriptor = queryCache.get<{ v: number }>(queryDescriptor);
+            queryCache.set(queryDescriptor, { v: 42 });
+          },
+        }),
+      { wrapper }
+    );
+
+    result.current.mutate();
+
+    await waitFor(() => expect(result.current.isPending).toBe(false));
+
+    expect(capturedViaDescriptor).toEqual({ v: 0 });
+    expect(client.getQueryData([...QUERY_KEY])).toEqual({ v: 42 });
+  });
+
+  it('queryCache.set supports an updater function for atomic read-modify-write', async () => {
+    const client = buildMutationCacheTestQueryClient();
+    const wrapper = makeQueryWrapper(client);
+
+    const QUERY_KEY = ['@test', 'list'];
+    client.setQueryData(QUERY_KEY, ['a', 'b']);
+
+    const endpoint = makeMutationDescriptor<void, void>(['appendC'], async () => undefined);
+
+    const { result } = renderHook(
+      () =>
+        useApiMutation<void, Error, void>({
+          endpoint,
+          onMutate: async (_variables, { queryCache }) => {
+            // Updater function receives the current value; return appended list.
+            queryCache.set<string[]>(QUERY_KEY, (old) => [...(old ?? []), 'c']);
+          },
+        }),
+      { wrapper }
+    );
+
+    result.current.mutate();
+
+    await waitFor(() => expect(result.current.isPending).toBe(false));
+    // Updater appended 'c' atomically.
+    expect(client.getQueryData(QUERY_KEY)).toEqual(['a', 'b', 'c']);
+  });
+
+  it('queryCache.invalidate in onSettled marks cached queries as stale', async () => {
+    const client = buildMutationCacheTestQueryClient();
+    const wrapper = makeQueryWrapper(client);
+
+    const QUERY_KEY = ['@test', 'entity'];
+    client.setQueryData(QUERY_KEY, { value: 'original' });
+
+    const endpoint = makeMutationDescriptor<void, void>(['noopInvalidate'], async () => undefined);
+
+    const { result } = renderHook(
+      () =>
+        useApiMutation<void, Error, void>({
+          endpoint,
+          onSettled: async (_data, _error, _variables, _context, { queryCache }) => {
+            await queryCache.invalidate(QUERY_KEY);
+          },
+        }),
+      { wrapper }
+    );
+
+    result.current.mutate();
+
+    await waitFor(() => expect(result.current.isPending).toBe(false));
+    // After invalidation, the query is marked stale (isInvalidated flag).
+    const queryState = client.getQueryState(QUERY_KEY);
+    expect(queryState?.isInvalidated).toBe(true);
+  });
+
+  it('uses the latest lifecycle callback closures after rerender while a mutation is in flight', async () => {
+    const client = buildMutationCacheTestQueryClient();
+    const wrapper = makeQueryWrapper(client);
+
+    const FIRST_QUERY_KEY = ['@test', 'settled-first'];
+    const SECOND_QUERY_KEY = ['@test', 'settled-second'];
+    client.setQueryData(FIRST_QUERY_KEY, { value: 'first' });
+    client.setQueryData(SECOND_QUERY_KEY, { value: 'second' });
+
+    let resolveMutation!: () => void;
+    const mutationGate = new Promise<void>((resolve) => {
+      resolveMutation = resolve;
+    });
+
+    const endpoint = makeMutationDescriptor<void, void>(
+      ['rerenderedSettledCallback'],
+      async () => {
+        await mutationGate;
+      }
+    );
+
+    const { result, rerender } = renderHook(
+      ({ queryKey }: { queryKey: readonly unknown[] }) =>
+        useApiMutation<void, Error, void>({
+          endpoint,
+          onSettled: async (_data, _error, _variables, _context, { queryCache }) => {
+            await queryCache.invalidate(queryKey);
+          },
+        }),
+      {
+        wrapper,
+        initialProps: { queryKey: FIRST_QUERY_KEY },
+      }
+    );
+
+    let mutatePromise!: Promise<void>;
+    await act(async () => {
+      mutatePromise = result.current.mutateAsync();
+    });
+
+    rerender({ queryKey: SECOND_QUERY_KEY });
+
+    await act(async () => {
+      resolveMutation();
+      await mutatePromise;
+    });
+
+    await waitFor(() =>
+      expect(client.getQueryState(SECOND_QUERY_KEY)?.isInvalidated).toBe(true)
+    );
+    expect(client.getQueryState(FIRST_QUERY_KEY)?.isInvalidated).not.toBe(true);
+  });
+
+  it('onError receives { queryCache } for snapshot rollback on mutation failure', async () => {
+    const client = buildMutationCacheTestQueryClient();
+    const wrapper = makeQueryWrapper(client);
+
+    const QUERY_KEY = ['@test', 'rollback'];
+    client.setQueryData(QUERY_KEY, { value: 'original' });
+
+    const endpoint = makeMutationDescriptor<void, void>(
+      ['alwaysFail'],
+      async () => { throw new Error('server error'); }
+    );
+
+    const { result } = renderHook(
+      () =>
+        useApiMutation<void, Error, void, { snapshot: unknown }>({
+          endpoint,
+          onMutate: async (_variables, { queryCache }) => {
+            const snapshot = queryCache.get(QUERY_KEY);
+            queryCache.set(QUERY_KEY, { value: 'optimistic' });
+            return { snapshot };
+          },
+          onError: async (_error, _variables, context, { queryCache }) => {
+            // Restore the snapshot using the context from onMutate.
+            if (context?.snapshot !== undefined) {
+              queryCache.set(QUERY_KEY, context.snapshot);
+            }
+          },
+        }),
+      { wrapper }
+    );
+
+    result.current.mutate();
+
+    await waitFor(() => expect(result.current.error).toBeDefined());
+    // After rollback, the original value is restored.
+    expect(client.getQueryData(QUERY_KEY)).toEqual({ value: 'original' });
+  });
+
+  it('does not abort the descriptor fetch signal on unmount by default', async () => {
+    expect.assertions(2);
+    const client = buildTestQueryClient();
+    const wrapper = makeQueryWrapper(client);
+
+    let resolveGate!: () => void;
+    const gate = new Promise<void>((r) => {
+      resolveGate = r;
+    });
+
+    let ranPastGate = false;
+    const endpoint = makeMutationDescriptor<string, void>(['abortOnUnmount'], async (_vars, opts) => {
+      await gate;
+      if (opts?.signal?.aborted) {
+        throw new DOMException('Aborted', 'AbortError');
+      }
+      ranPastGate = true;
+      return 'should-not-win';
+    });
+
+    const { result, unmount } = renderHook(
+      () => useApiMutation<string, Error, void>({ endpoint }),
+      { wrapper }
+    );
+
+    let mutatePromise!: Promise<string>;
+    await act(async () => {
+      mutatePromise = result.current.mutateAsync();
+    });
+
+    unmount();
+
+    await act(async () => {
+      resolveGate();
+      await expect(mutatePromise).resolves.toBe('should-not-win');
+    });
+    expect(ranPastGate).toBe(true);
+  });
+
+  it('aborts the descriptor fetch signal on unmount when abortOnUnmount is enabled', async () => {
+    expect.assertions(2);
+    const client = buildTestQueryClient();
+    const wrapper = makeQueryWrapper(client);
+
+    let resolveGate!: () => void;
+    const gate = new Promise<void>((r) => {
+      resolveGate = r;
+    });
+
+    let ranPastGate = false;
+    const endpoint = makeMutationDescriptor<string, void>(['abortOnUnmountEnabled'], async (_vars, opts) => {
+      await gate;
+      if (opts?.signal?.aborted) {
+        throw new DOMException('Aborted', 'AbortError');
+      }
+      ranPastGate = true;
+      return 'should-not-win';
+    });
+
+    const { result, unmount } = renderHook(
+      () => useApiMutation<string, Error, void>({ endpoint, abortOnUnmount: true }),
+      { wrapper }
+    );
+
+    let mutatePromise!: Promise<string>;
+    await act(async () => {
+      mutatePromise = result.current.mutateAsync();
+    });
+
+    unmount();
+
+    await act(async () => {
+      resolveGate();
+      await expect(mutatePromise).rejects.toMatchObject({ name: 'AbortError' });
+    });
+    expect(ranPastGate).toBe(false);
+  });
+
+  it('aborts all in-flight descriptor fetch signals on unmount when abortOnUnmount is enabled', async () => {
+    expect.assertions(4);
+    const client = buildTestQueryClient();
+    const wrapper = makeQueryWrapper(client);
+
+    let resolveGate1!: () => void;
+    const gate1 = new Promise<void>((r) => {
+      resolveGate1 = r;
+    });
+    let resolveGate2!: () => void;
+    const gate2 = new Promise<void>((r) => {
+      resolveGate2 = r;
+    });
+
+    let firstRanPastGate = false;
+    let secondRanPastGate = false;
+    const endpoint = makeMutationDescriptor<number, { batch: 1 | 2 }>(
+      ['abortAllOnUnmount'],
+      async (vars, opts) => {
+        await (vars.batch === 1 ? gate1 : gate2);
+        if (opts?.signal?.aborted) {
+          throw new DOMException('Aborted', 'AbortError');
+        }
+        if (vars.batch === 1) {
+          firstRanPastGate = true;
+        } else {
+          secondRanPastGate = true;
+        }
+        return vars.batch;
+      }
+    );
+
+    const { result, unmount } = renderHook(
+      () => useApiMutation<number, Error, { batch: 1 | 2 }>({ endpoint, abortOnUnmount: true }),
+      { wrapper }
+    );
+
+    let firstPromise!: Promise<number>;
+    let secondPromise!: Promise<number>;
+    await act(async () => {
+      firstPromise = result.current.mutateAsync({ batch: 1 });
+    });
+    await act(async () => {
+      secondPromise = result.current.mutateAsync({ batch: 2 });
+    });
+
+    unmount();
+
+    await act(async () => {
+      resolveGate1();
+      resolveGate2();
+      await expect(firstPromise).rejects.toMatchObject({ name: 'AbortError' });
+      await expect(secondPromise).rejects.toMatchObject({ name: 'AbortError' });
+    });
+
+    expect(firstRanPastGate).toBe(false);
+    expect(secondRanPastGate).toBe(false);
+  });
+
+  it('does not abort the prior in-flight fetch when a new mutateAsync starts by default', async () => {
+    expect.assertions(3);
+    const client = buildTestQueryClient();
+    const wrapper = makeQueryWrapper(client);
+
+    let resolveGate1!: () => void;
+    const gate1 = new Promise<void>((r) => {
+      resolveGate1 = r;
+    });
+    let resolveGate2!: () => void;
+    const gate2 = new Promise<void>((r) => {
+      resolveGate2 = r;
+    });
+
+    let firstCompleted = false;
+    const endpoint = makeMutationDescriptor<number, { batch: 1 | 2 }>(
+      ['abortSupersede'],
+      async (vars, opts) => {
+        await (vars.batch === 1 ? gate1 : gate2);
+        if (opts?.signal?.aborted) {
+          throw new DOMException('Aborted', 'AbortError');
+        }
+        if (vars.batch === 1) {
+          firstCompleted = true;
+        }
+        return vars.batch;
+      }
+    );
+
+    const { result } = renderHook(
+      () => useApiMutation<number, Error, { batch: 1 | 2 }>({ endpoint }),
+      { wrapper }
+    );
+
+    let firstPromise!: Promise<number>;
+    let secondPromise!: Promise<number>;
+    await act(async () => {
+      firstPromise = result.current.mutateAsync({ batch: 1 });
+    });
+    await act(async () => {
+      secondPromise = result.current.mutateAsync({ batch: 2 });
+    });
+
+    await act(async () => {
+      resolveGate1();
+      await expect(firstPromise).resolves.toBe(1);
+    });
+    expect(firstCompleted).toBe(true);
+
+    await act(async () => {
+      resolveGate2();
+      await expect(secondPromise).resolves.toBe(2);
+    });
+  });
+
+  it('aborts the prior in-flight fetch when cancelOnSupersede is enabled', async () => {
+    expect.assertions(3);
+    const client = buildTestQueryClient();
+    const wrapper = makeQueryWrapper(client);
+
+    let resolveGate1!: () => void;
+    const gate1 = new Promise<void>((r) => {
+      resolveGate1 = r;
+    });
+    let resolveGate2!: () => void;
+    const gate2 = new Promise<void>((r) => {
+      resolveGate2 = r;
+    });
+
+    let firstCompleted = false;
+    const endpoint = makeMutationDescriptor<number, { batch: 1 | 2 }>(
+      ['abortSupersedeEnabled'],
+      async (vars, opts) => {
+        await (vars.batch === 1 ? gate1 : gate2);
+        if (opts?.signal?.aborted) {
+          throw new DOMException('Aborted', 'AbortError');
+        }
+        if (vars.batch === 1) {
+          firstCompleted = true;
+        }
+        return vars.batch;
+      }
+    );
+
+    const { result } = renderHook(
+      () => useApiMutation<number, Error, { batch: 1 | 2 }>({ endpoint, cancelOnSupersede: true }),
+      { wrapper }
+    );
+
+    let firstPromise!: Promise<number>;
+    let secondPromise!: Promise<number>;
+    await act(async () => {
+      firstPromise = result.current.mutateAsync({ batch: 1 });
+    });
+    await act(async () => {
+      secondPromise = result.current.mutateAsync({ batch: 2 });
+    });
+
+    await act(async () => {
+      resolveGate1();
+      await expect(firstPromise).rejects.toMatchObject({ name: 'AbortError' });
+    });
+    expect(firstCompleted).toBe(false);
+
+    await act(async () => {
+      resolveGate2();
+      await expect(secondPromise).resolves.toBe(2);
+    });
+  });
+});
+
+// ============================================================================
+// useApiMutation across a cache scope change
+// ============================================================================
+
+describe('useApiMutation when the cache scope changes while a mutation is in flight', () => {
+  const QUERY_KEY = ['@test', 'scoped-entity'];
+
+  async function renderOnHost<TResult>(useHook: () => TResult) {
+    const hostApp = await buildHostAppWithQueryCache(60_000);
+    const client = getAttachedQueryClient(hostApp);
+    const rendered = renderHook(useHook, {
+      wrapper: ({ children }) => <FrontXProvider app={hostApp}>{children}</FrontXProvider>,
+    });
+    return { client, result: rendered.result };
+  }
+
+  it('drops an onSuccess write of the old scope response', async () => {
+    let resolveMutation!: (value: string) => void;
+    const endpoint = makeMutationDescriptor<string, void>(
+      ['scopedSave'],
+      () => new Promise<string>((resolve) => {
+        resolveMutation = resolve;
+      })
+    );
+
+    const { client, result } = await renderOnHost(() =>
+      useApiMutation<string, Error, void>({
+        endpoint,
+        onSuccess: (data, _variables, _context, { queryCache }) => {
+          queryCache.set(QUERY_KEY, data);
+        },
+      })
+    );
+
+    let mutatePromise!: Promise<string>;
+    await act(async () => {
+      mutatePromise = result.current.mutateAsync();
+    });
+    act(() => {
+      eventBus.emit(TenantEvents.Changed, { tenant: { id: 'tenant-b' } });
+    });
+    await act(async () => {
+      resolveMutation('tenant A response');
+      await mutatePromise;
+    });
+
+    expect(client.getQueryData(QUERY_KEY)).toBeUndefined();
+  });
+
+  it('drops an onError snapshot restore of the old scope data', async () => {
+    let rejectMutation!: (error: Error) => void;
+    const endpoint = makeMutationDescriptor<void, void>(
+      ['scopedFailingSave'],
+      () => new Promise<void>((_resolve, reject) => {
+        rejectMutation = reject;
+      })
+    );
+
+    const { client, result } = await renderOnHost(() =>
+      useApiMutation<void, Error, void, { snapshot: unknown }>({
+        endpoint,
+        onMutate: (_variables, { queryCache }) => {
+          const snapshot = queryCache.get(QUERY_KEY);
+          queryCache.set(QUERY_KEY, 'optimistic');
+          return { snapshot };
+        },
+        onError: (_error, _variables, context, { queryCache }) => {
+          queryCache.set(QUERY_KEY, context?.snapshot);
+        },
+      })
+    );
+    client.setQueryData(QUERY_KEY, 'old session data');
+
+    let mutatePromise!: Promise<void>;
+    await act(async () => {
+      mutatePromise = result.current.mutateAsync();
+    });
+    expect(client.getQueryData(QUERY_KEY)).toBe('optimistic');
+    act(() => {
+      eventBus.emit(AuthEvents.LoggedOut, {});
+    });
+    await act(async () => {
+      rejectMutation(new Error('server error'));
+      await expect(mutatePromise).rejects.toThrow('server error');
+    });
+
+    expect(client.getQueryData(QUERY_KEY)).toBeUndefined();
+  });
+
+  async function renderHeldBackRollback() {
+    let rejectMutation!: (error: Error) => void;
+    const endpoint = makeMutationDescriptor<void, void>(
+      ['checkedFailingSave'],
+      () => new Promise<void>((_resolve, reject) => {
+        rejectMutation = reject;
+      })
+    );
+    const rendered = await renderOnHost(() =>
+      useApiMutation<void, Error, void, { snapshot: unknown }>({
+        endpoint,
+        onMutate: (_variables, { queryCache }) => {
+          const snapshot = queryCache.get(QUERY_KEY);
+          queryCache.set(QUERY_KEY, 'optimistic');
+          return { snapshot };
+        },
+        onError: (_error, _variables, context, { queryCache }) => {
+          queryCache.set(QUERY_KEY, context?.snapshot);
+        },
+      })
+    );
+    let serverReads = 0;
+    const { QueryObserver } = await import('@tanstack/query-core');
+    const observer = new QueryObserver(rendered.client, {
+      queryKey: QUERY_KEY,
+      // Each read is numbered, so a refetch is told apart from a rollback to the first read.
+      queryFn: async () => `server read ${++serverReads}`,
+      staleTime: Number.POSITIVE_INFINITY,
+    });
+    onTestFinished(observer.subscribe(() => undefined));
+    await waitFor(() => {
+      expect(rendered.client.getQueryData(QUERY_KEY)).toBe('server read 1');
+    });
+    let mutatePromise!: Promise<void>;
+    await act(async () => {
+      mutatePromise = rendered.result.current.mutateAsync();
+    });
+    expect(rendered.client.getQueryData(QUERY_KEY)).toBe('optimistic');
+    const settle = async () => {
+      await act(async () => {
+        rejectMutation(new Error('server error'));
+        await expect(mutatePromise).rejects.toThrow('server error');
+      });
+    };
+    return { client: rendered.client, settle };
+  }
+
+  /** Lets the mutation cache deliver its notifications, which TanStack batches into a macrotask. */
+  async function flushNotifications() {
+    await act(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
+  }
+
+  it('refreshes the cache once a held mutation whose rollback was dropped has settled, cancelling running reads and keeping observed queries', async () => {
+    const { client, settle } = await renderHeldBackRollback();
+    // A refresh starts by cancelling running reads, synchronously from the mutation cache notification.
+    const cancelQueries = vi.spyOn(client, 'cancelQueries');
+    onTestFinished(() => {
+      cancelQueries.mockRestore();
+    });
+    const UNOBSERVED_KEY = ['@test', 'unmounted-entity'];
+    client.setQueryData(UNOBSERVED_KEY, 'optimistic elsewhere');
+    const DISABLED_KEY = ['@test', 'disabled-entity'];
+    client.setQueryData(DISABLED_KEY, 'optimistic too');
+    const { QueryObserver } = await import('@tanstack/query-core');
+    onTestFinished(new QueryObserver(client, { queryKey: DISABLED_KEY, enabled: false }).subscribe(() => undefined));
+    let finishFetch!: (value: string) => void;
+    // A read of the mounted but disabled query, running when the mutation settles: it may predate the
+    // mutation. The outcome is captured at once, so a rejection is handled even if an assertion fails.
+    const runningFetch = client
+      .fetchQuery({
+        queryKey: DISABLED_KEY,
+        staleTime: 0,
+        queryFn: () => new Promise<string>((resolve) => {
+          finishFetch = resolve;
+        }),
+      })
+      .then(
+        (value) => ({ value }),
+        (error: unknown) => ({ error })
+      );
+
+    act(() => {
+      eventBus.emit(AuthEvents.SessionCheck, {});
+      // Removed from the cache, the mutation still runs and is still waited for.
+      const mutationCache = client.getMutationCache();
+      mutationCache.getAll().forEach((mutation) => {
+        mutationCache.remove(mutation);
+      });
+    });
+    await flushNotifications();
+    // A refetch now would read the server before the mutation is done.
+    expect(cancelQueries).not.toHaveBeenCalled();
+    expect(client.getQueryData(QUERY_KEY)).toBe('optimistic');
+    expect(client.getQueryData(UNOBSERVED_KEY)).toBe('optimistic elsewhere');
+    await settle();
+    await flushNotifications();
+    expect(cancelQueries).toHaveBeenCalledTimes(1);
+
+    await waitFor(() => {
+      expect(client.getQueryData(QUERY_KEY)).toBe('server read 2');
+    });
+    expect(client.getQueryCache().find({ queryKey: UNOBSERVED_KEY })).toBeUndefined();
+    // The running read is cancelled and cannot land; the mounted query stays, marked for a refetch.
+    finishFetch('pre-mutation read');
+    expect(await runningFetch).toEqual({ value: 'optimistic too' });
+    expect(client.getQueryData(DISABLED_KEY)).toBe('optimistic too');
+    expect(client.getQueryState(DISABLED_KEY)?.isInvalidated).toBe(true);
+  });
+
+  it('lets held mutations go when the session check ends in a clear', async () => {
+    const { client, settle } = await renderHeldBackRollback();
+
+    act(() => {
+      eventBus.emit(AuthEvents.SessionCheck, {});
+      eventBus.emit(AuthEvents.LoggedIn, {});
+    });
+    expect(client.getQueryData(QUERY_KEY)).toBeUndefined();
+    // The clear already dropped everything; a refresh on top would only refetch the new session's data.
+    // A refresh starts by cancelling running reads, synchronously from the mutation cache notification.
+    const cancelQueries = vi.spyOn(client, 'cancelQueries');
+    onTestFinished(() => {
+      cancelQueries.mockRestore();
+    });
+    await settle();
+    await flushNotifications();
+
+    expect(cancelQueries).not.toHaveBeenCalled();
+  });
+
+  it('leaves a refresh to a newer session check that holds mutations while it cancels running reads', async () => {
+    const { client, settle } = await renderHeldBackRollback();
+    act(() => {
+      eventBus.emit(AuthEvents.SessionCheck, {});
+    });
+    let finishLater!: () => void;
+    const later = client
+      .getMutationCache()
+      .build(client, {
+        mutationFn: () => new Promise<void>((resolve) => {
+          finishLater = resolve;
+        }),
+      })
+      .execute(undefined);
+    const cancelQueries = client.cancelQueries.bind(client);
+    let refreshCancel: Promise<void> | undefined;
+    const cancelSpy = vi.spyOn(client, 'cancelQueries').mockImplementationOnce((...args) => {
+      eventBus.emit(AuthEvents.SessionCheck, {});
+      refreshCancel = cancelQueries(...args);
+      return refreshCancel;
+    });
+    const invalidateQueries = vi.spyOn(client, 'invalidateQueries');
+    onTestFinished(() => {
+      cancelSpy.mockRestore();
+      invalidateQueries.mockRestore();
+    });
+    await settle();
+    await flushNotifications();
+    // The refresh resumes right after its own cancel, ahead of this await.
+    await act(async () => {
+      await refreshCancel;
+    });
+    // The newer check holds the later mutation, so a refetch now would read the server before it is done.
+    expect(cancelSpy).toHaveBeenCalled();
+    expect(invalidateQueries).not.toHaveBeenCalled();
+
+    await act(async () => {
+      finishLater();
+      await later;
+    });
+    await flushNotifications();
+    await waitFor(() => {
+      expect(invalidateQueries).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('stops a refresh when the scope changes while it cancels running reads', async () => {
+    const { client, settle } = await renderHeldBackRollback();
+    act(() => {
+      eventBus.emit(AuthEvents.SessionCheck, {});
+    });
+    // The scope changes while the refresh waits for its cancel: the clear already dropped everything.
+    const cancelQueries = client.cancelQueries.bind(client);
+    let refreshCancel: Promise<void> | undefined;
+    const cancelSpy = vi.spyOn(client, 'cancelQueries').mockImplementationOnce((...args) => {
+      eventBus.emit(AuthEvents.LoggedIn, {});
+      refreshCancel = cancelQueries(...args);
+      return refreshCancel;
+    });
+    const invalidateQueries = vi.spyOn(client, 'invalidateQueries');
+    const removeQueries = vi.spyOn(client, 'removeQueries');
+    onTestFinished(() => {
+      cancelSpy.mockRestore();
+      invalidateQueries.mockRestore();
+      removeQueries.mockRestore();
+    });
+    await settle();
+    await flushNotifications();
+    // The refresh resumes right after its own cancel, ahead of this await.
+    await act(async () => {
+      await refreshCancel;
+    });
+
+    expect(cancelSpy).toHaveBeenCalled();
+    expect(removeQueries).not.toHaveBeenCalled();
+    expect(invalidateQueries).not.toHaveBeenCalled();
+  });
+
+  it('does not refresh after a held mutation that had no write dropped', async () => {
+    const { client, settle } = await renderHeldBackRollback();
+    // The hook's mutation settles before the check, so its rollback lands and nothing of it is held.
+    await settle();
+    let finishPlain!: () => void;
+    const plain = client
+      .getMutationCache()
+      .build(client, {
+        mutationFn: () => new Promise<void>((resolve) => {
+          finishPlain = resolve;
+        }),
+      })
+      .execute(undefined);
+    await waitFor(() => {
+      expect(finishPlain).toBeTypeOf('function');
+    });
+    // A mutation without cache callbacks: holding it drops no write.
+    const cancelQueries = vi.spyOn(client, 'cancelQueries');
+    onTestFinished(() => {
+      cancelQueries.mockRestore();
+    });
+    act(() => {
+      eventBus.emit(AuthEvents.SessionCheck, {});
+    });
+    await act(async () => {
+      finishPlain();
+      await plain;
+    });
+    await flushNotifications();
+
+    expect(cancelQueries).not.toHaveBeenCalled();
+  });
+
+  it('drops an onError write when the scope changed before an async onMutate threw', async () => {
+    let releaseOnMutate!: () => void;
+    const onMutateGate = new Promise<void>((resolve) => {
+      releaseOnMutate = resolve;
+    });
+    const endpoint = makeMutationDescriptor<void, void>(['scopedOnMutateThrow'], async () => undefined);
+
+    const { client, result } = await renderOnHost(() =>
+      useApiMutation<void, Error, void>({
+        endpoint,
+        onMutate: async () => {
+          await onMutateGate;
+          throw new Error('onMutate failed');
+        },
+        onError: (_error, _variables, _context, { queryCache }) => {
+          queryCache.set(QUERY_KEY, 'old scope write');
+        },
+      })
+    );
+
+    let mutatePromise!: Promise<void>;
+    await act(async () => {
+      mutatePromise = result.current.mutateAsync();
+    });
+    act(() => {
+      eventBus.emit(TenantEvents.Changed, { tenant: { id: 'tenant-b' } });
+    });
+    await act(async () => {
+      releaseOnMutate();
+      await expect(mutatePromise).rejects.toThrow('onMutate failed');
+    });
+
+    expect(client.getQueryData(QUERY_KEY)).toBeUndefined();
+  });
+
+  it('lands an onSuccess write of a mutation started after the scope changed', async () => {
+    const endpoint = makeMutationDescriptor<string, void>(['newScopeSave'], async () => 'tenant B response');
+
+    const { client, result } = await renderOnHost(() =>
+      useApiMutation<string, Error, void>({
+        endpoint,
+        onSuccess: (data, _variables, _context, { queryCache }) => {
+          queryCache.set(QUERY_KEY, data);
+        },
+      })
+    );
+
+    act(() => {
+      eventBus.emit(TenantEvents.Changed, { tenant: { id: 'tenant-b' } });
+    });
+    await act(async () => {
+      await result.current.mutateAsync();
+    });
+
+    expect(client.getQueryData(QUERY_KEY)).toBe('tenant B response');
+  });
+
+  it('writes to the QueryClient it started under when the provider swaps its client', async () => {
+    let resolveMutation!: (value: string) => void;
+    const endpoint = makeMutationDescriptor<string, void>(
+      ['swappedClientSave'],
+      () => new Promise<string>((resolve) => {
+        resolveMutation = resolve;
+      })
+    );
+    const startClient = buildMutationCacheTestQueryClient();
+    const nextClient = buildMutationCacheTestQueryClient();
+    let app = buildAppWithQueryClient(startClient);
+    const nextApp = await buildAppInOtherRuntime(nextClient);
+
+    const { result, rerender } = renderHook(
+      () =>
+        useApiMutation<string, Error, void>({
+          endpoint,
+          onSuccess: (data, _variables, _context, { queryCache }) => {
+            queryCache.set(QUERY_KEY, data);
+          },
+        }),
+      { wrapper: ({ children }) => <FrontXProvider app={app}>{children}</FrontXProvider> }
+    );
+
+    let mutatePromise!: Promise<string>;
+    await act(async () => {
+      mutatePromise = result.current.mutateAsync();
+    });
+    app = nextApp;
+    rerender();
+    await act(async () => {
+      resolveMutation('start client response');
+      await mutatePromise;
+    });
+
+    expect(nextClient.getQueryData(QUERY_KEY)).toBeUndefined();
+    expect(startClient.getQueryData(QUERY_KEY)).toBe('start client response');
+  });
+});
+
+// ============================================================================
+// createQueryCache.invalidateMany
+// ============================================================================
+
+describe('createQueryCache.invalidateMany', () => {
+  it('does not call invalidateQueries when queryKey is missing, null, or empty', async () => {
+    const queryClient = buildTestQueryClient();
+    const invalidateSpy = vi.spyOn(queryClient, 'invalidateQueries');
+    const cache = createQueryCache(queryClient);
+
+    await cache.invalidateMany();
+    await cache.invalidateMany({});
+    await cache.invalidateMany({ queryKey: undefined });
+    await cache.invalidateMany({ queryKey: null });
+    await cache.invalidateMany({ queryKey: [] });
+
+    expect(invalidateSpy).not.toHaveBeenCalled();
+    invalidateSpy.mockRestore();
+  });
+
+  it('invalidates when queryKey is present', async () => {
+    const queryClient = buildTestQueryClient();
+    const queryKey = ['@test', 'invalidate-many'] as const;
+    queryClient.setQueryData(queryKey, { ok: true });
+    const cache = createQueryCache(queryClient);
+
+    await cache.invalidateMany({ queryKey });
+
+    expect(queryClient.getQueryState(queryKey)?.isInvalidated).toBe(true);
+  });
+});
+
+// ============================================================================
+// Cross-root cache sync
+// ============================================================================
+
+describe('QueryCache stays shared across separate providers', () => {
+  it('queryCache.set broadcasts updates into sibling providers using a different QueryClient', async () => {
+    const clientA = buildMutationCacheTestQueryClient();
+    const appB = buildPresetApp();
+    const clientB = getAttachedQueryClient(appB);
+    const queryKey = ['@test', 'broadcast', 'set'] as const;
+
+    expect(clientB).not.toBe(clientA);
+    clientA.setQueryData(queryKey, { value: 'seed-a' });
+    clientB.setQueryData(queryKey, { value: 'seed-b' });
+
+    const queryCacheA = createQueryCache(clientA);
+
+    queryCacheA.set(queryKey, { value: 'optimistic' });
+
+    expect(clientA.getQueryData(queryKey)).toEqual({ value: 'optimistic' });
+    await waitFor(() =>
+      expect(clientB.getQueryData(queryKey)).toEqual({ value: 'optimistic' })
+    );
+  });
+
+  it('queryCache.set rollback restores sibling providers using a different QueryClient', async () => {
+    const clientA = buildMutationCacheTestQueryClient();
+    const appB = buildPresetApp();
+    const clientB = getAttachedQueryClient(appB);
+    const queryKey = ['@test', 'broadcast', 'rollback'] as const;
+
+    expect(clientB).not.toBe(clientA);
+    clientA.setQueryData(queryKey, { value: 'original' });
+    clientB.setQueryData(queryKey, { value: 'original' });
+
+    const queryCacheA = createQueryCache(clientA);
+
+    queryCacheA.set(queryKey, { value: 'optimistic' });
+    expect(clientA.getQueryData(queryKey)).toEqual({ value: 'optimistic' });
+    await waitFor(() =>
+      expect(clientB.getQueryData(queryKey)).toEqual({ value: 'optimistic' })
+    );
+
+    queryCacheA.set(queryKey, { value: 'original' });
+    await waitFor(() => {
+      expect(clientA.getQueryData(queryKey)).toEqual({ value: 'original' });
+      expect(clientB.getQueryData(queryKey)).toEqual({ value: 'original' });
+    });
+  });
+
+  it('queryCache.invalidate broadcasts stale state into sibling providers using a different QueryClient', async () => {
+    const clientA = buildMutationCacheTestQueryClient();
+    const appB = buildPresetApp();
+    const clientB = getAttachedQueryClient(appB);
+    const queryKey = ['@test', 'broadcast', 'invalidate'] as const;
+
+    expect(clientB).not.toBe(clientA);
+    clientA.setQueryData(queryKey, { value: 'stale-a' });
+    clientB.setQueryData(queryKey, { value: 'stale-b' });
+
+    const queryCacheA = createQueryCache(clientA);
+
+    await queryCacheA.invalidate(queryKey);
+
+    await waitFor(() => {
+      expect(clientA.getQueryState(queryKey)?.isInvalidated).toBe(true);
+      expect(clientB.getQueryState(queryKey)?.isInvalidated).toBe(true);
+    });
+  });
+
+  it('queryCache.remove broadcasts removals into sibling providers using a different QueryClient', async () => {
+    const clientA = buildMutationCacheTestQueryClient();
+    const appB = buildPresetApp();
+    const clientB = getAttachedQueryClient(appB);
+    const queryKey = ['@test', 'broadcast', 'remove'] as const;
+
+    expect(clientB).not.toBe(clientA);
+    clientA.setQueryData(queryKey, { value: 'seed-a' });
+    clientB.setQueryData(queryKey, { value: 'seed-b' });
+
+    const queryCacheA = createQueryCache(clientA);
+
+    queryCacheA.remove(queryKey);
+
+    await waitFor(() => {
+      expect(clientA.getQueryState(queryKey)).toBeUndefined();
+      expect(clientB.getQueryState(queryKey)).toBeUndefined();
+    });
+  });
+});

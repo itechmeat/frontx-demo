@@ -1,0 +1,475 @@
+#!/usr/bin/env node
+/**
+ * design-verify runner - one command that turns the dev-only runtime
+ * design-defect checker into repeatable evidence: drive the app in headless
+ * Chrome across a routes x themes x widths matrix, call
+ * `window.__frontxDesignDefects()` in every state, and emit findings.json
+ * plus screenshots on a stable naming convention.
+ *
+ * This replaces the ad-hoc CDP scripts agents previously authored per run
+ * (the guardrails pilot wrote and re-ran /tmp/verify.mjs + /tmp/shots.mjs
+ * from scratch - minutes of throwaway harness work every time). The runner
+ * is the owned form of that harness; the design skill's ban on
+ * improvised browser automation stands, and this is the sanctioned path.
+ *
+ * Invocation (from the shell project root):
+ *   npm run verify:ui --workspace=@gears-frontx/design-verify -- \
+ *     --routes /login,/tasks [--design-md DESIGN.md]
+ *
+ * The default widths are 1440, 768, 390 and 320 CSS px and the default
+ * themes light and dark.
+ *
+ * Every finding carries the gate the frontx-design skill's
+ * rules/render-check.json gives its rule id, and a finding the per-screen
+ * waiver file covers moves to its state's waived list (runner/waivers.mjs).
+ *
+ * See --help (runner/config.mjs USAGE) for every flag. Exit codes: 0 ran
+ * (findings are advisory), 1 findings + --fail-on-findings, 2 environment
+ * failure, an input the run cannot honour (a bad flag, baseline or waiver
+ * file, a missing skill rule file) or a requested screenshot that could not
+ * be produced - an unverified state is never reported as a pass.
+ */
+import fs from 'node:fs';
+import path from 'node:path';
+import process from 'node:process';
+import { parseArgs, expandMatrix, resolvePaths, resolveServerCwd, shotName, USAGE } from './config.mjs';
+import { CdpSession, newTarget } from './cdp.mjs';
+import { findChrome, launchChrome } from './chrome.mjs';
+import { isUrlReachable, waitForUrl, startServer } from './server.mjs';
+import {
+  buildReport,
+  diffReports,
+  exitCode,
+  gateLookup,
+  measuredScreens,
+  summaryLines,
+  sweepState,
+} from './report.mjs';
+import { appliedThemeExpression, themeSeedExpression } from './theme.mjs';
+import { ContractError, designMdParser, isEntryPoint, projectRoot, readSkillJson } from './skill.mjs';
+import { CONTRAST_CHECK, contrastPairs, contrastState, ContrastInputError, probeExpression } from './contrast.mjs';
+import { coversRendered, loadWaivers, waiverReport, WaiverError } from './waivers.mjs';
+
+const SWEEP_LINE = /\[design-defects\]/;
+/** The pause before a second look at a started command that the URL answered for. */
+const SERVER_EXIT_RECHECK_MS = 500;
+/** How long a headless Chrome may take to announce its DevTools endpoint. */
+const CHROME_LAUNCH_TIMEOUT_MS = 20_000;
+/** The exit code a shell reports for a death by each signal the run stops on. */
+const SIGNAL_EXIT_CODES = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 };
+const VERIFY_PKG_FAILURE = /\[verify-packages\].*(none installed|failed to load)/;
+
+/** @param {string} base @param {string} route */
+function joinUrl(base, route) {
+  return `${base.replace(/\/$/, '')}/${route.replace(/^\//, '')}`;
+}
+
+/**
+ * Menu-mode activation: click the sidebar item with this label, then wait
+ * for a screen to actually mount (an open shadow root appearing). Shells
+ * that mount screens on menu action render only the empty shell for a
+ * deep-linked URL - sweeping that measures nothing while reporting clean.
+ *
+ * @param {import('./cdp.mjs').CdpSession} session
+ * @param {string} label
+ * @param {number} timeoutMs
+ * @returns {Promise<string | undefined>} error message, or undefined on success
+ */
+async function activateMenu(session, label, timeoutMs) {
+  const click = await session.evaluate(
+    `(() => {
+      const wanted = ${JSON.stringify(label)}.trim().toLowerCase();
+      const el = Array.from(document.querySelectorAll('li,button,a'))
+        .find((e) => e.textContent.trim().toLowerCase() === wanted);
+      if (!el) return 'not-found';
+      (el.querySelector('button,a') ?? el).click();
+      return 'clicked';
+    })()`,
+  );
+  if (click.error !== undefined || click.value !== 'clicked') {
+    return `menu item "${label}" could not be clicked: ${click.error ?? click.value}`;
+  }
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const mounted = await session.evaluate(
+      `Array.from(document.querySelectorAll('*')).some((e) => e.shadowRoot)`,
+    );
+    if (mounted.value === true) return undefined;
+    if (Date.now() >= deadline) {
+      return `menu item "${label}" was clicked but no screen mounted within ${timeoutMs}ms`;
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+}
+
+/**
+ * The runner. Inputs are checked before any server, browser or sweep work,
+ * so an input the run cannot honour returns 2 at once.
+ *
+ * @param {string[]} [argv]
+ * @returns {Promise<number>} exit code
+ */
+export async function main(argv = process.argv.slice(2)) {
+  const parsed = parseArgs(argv);
+  if (parsed.config.help) {
+    console.log(USAGE);
+    return 0;
+  }
+  if (parsed.errors.length > 0) {
+    for (const error of parsed.errors) console.error(`design-verify: ${error}`);
+    console.error('run with --help for usage');
+    return 2;
+  }
+  const root = projectRoot();
+  const config = resolvePaths(parsed.config, root);
+  const mode = config.menus.length > 0 ? 'menu' : 'route';
+
+  // The gate of every rule id and the waiver file, before any sweeping: a
+  // waiver the run cannot honour fails now, not after minutes of work.
+  // The DESIGN.md pairs too, so a broken DESIGN.md fails before any browser work.
+  let gateFor;
+  let reportedGates;
+  let waivers;
+  let contrastSpec;
+  /** @type {import('./contrast.mjs').ContrastPair[] | undefined} */
+  let pairs;
+  let parser;
+  try {
+    const registry = readSkillJson('rules/quality-gates.json');
+    const renderCheck = readSkillJson('rules/render-check.json');
+    gateFor = gateLookup(renderCheck);
+    reportedGates = renderCheck.ruleGates.map((row) => row.gate);
+    waivers = loadWaivers(config.waivers || undefined, root, registry);
+    if (config.designMd) {
+      contrastSpec = renderCheck.designMdContrast;
+      parser = await designMdParser();
+      pairs = contrastPairs(parser.readDesignMd(config.designMd).front, contrastSpec);
+    }
+  } catch (error) {
+    const known =
+      error instanceof ContractError ||
+      error instanceof WaiverError ||
+      error instanceof ContrastInputError ||
+      (parser !== undefined && error instanceof parser.InputError);
+    if (!known) throw error;
+    console.error(`design-verify: ${error.message}`);
+    return 2;
+  }
+  const coversState = coversRendered(mode);
+  const probedThemes = new Set();
+
+  // Read the baseline up front: a bad path should fail before minutes of
+  // sweeping, not after.
+  let baselineReport;
+  if (config.baseline) {
+    try {
+      baselineReport = JSON.parse(fs.readFileSync(config.baseline, 'utf8'));
+    } catch (error) {
+      console.error(
+        `design-verify: --baseline ${config.baseline} could not be read: ` +
+          `${error instanceof Error ? error.message : String(error)}`,
+      );
+      return 2;
+    }
+  }
+
+  const cleanups = [];
+  /** @type {ReturnType<typeof startServer> | undefined} */
+  let server;
+  /** @type {ReturnType<typeof launchChrome> | undefined} */
+  let chromeLaunch;
+  let interrupted = false;
+  try {
+    if (config.startServer) {
+      if (await isUrlReachable(config.url)) {
+        // Whatever answers is not a server this run started, and nothing an
+        // HTTP answer carries tells this project's dev server from another
+        // project's on the same port: measuring it would report on the wrong
+        // app. A second server would die on the occupied port (or bind
+        // elsewhere), so the run starts nothing and refuses.
+        console.error(
+          `design-verify: ${config.url} already answers, but this run did not start that server, ` +
+            `so it cannot tell whether it is this project's app. Either stop the server holding it ` +
+            `and run again; or pass --url with a free port and start the server there (the template ` +
+            `shell's dev:all takes the host port from FRONTX_VERIFY_HOST_PORT); or run without ` +
+            `--start-server to measure the running server on purpose`,
+        );
+        return 2;
+      }
+      const serverCwd = resolveServerCwd(config);
+      console.log(`design-verify: starting dev server: ${config.startServer} (in ${serverCwd})`);
+      server = startServer(config.startServer, { cwd: serverCwd });
+      cleanups.push(server.stop);
+      // The command runs in its own process group, which a Ctrl-C at the
+      // terminal does not reach, and a signal ends this process without the
+      // finally below: left running, the server would keep --url, and the
+      // next run would refuse it. Stop it here at once. A Chrome still starting
+      // is not in the cleanups yet: wait for its launch to settle (a failed or
+      // timed-out launch stops its own Chrome) and stop what it started, with
+      // its temporary profile. Then exit as a shell reports a death by that
+      // signal. The handlers go with the first cleanup, so a second signal
+      // during the wait ends the run at once.
+      const stopOnSignal = async (signal) => {
+        interrupted = true;
+        const ran = [...cleanups].reverse();
+        for (const cleanup of ran) cleanup();
+        if (chromeLaunch) {
+          const launched = await Promise.race([
+            chromeLaunch.catch(() => undefined),
+            new Promise((r) => setTimeout(r, CHROME_LAUNCH_TIMEOUT_MS + 1_000)),
+          ]);
+          // A launch that settled before the signal put its stop among the
+          // cleanups that just ran.
+          if (launched && !ran.includes(launched.stop)) launched.stop();
+        }
+        process.exit(SIGNAL_EXIT_CODES[signal]);
+      };
+      for (const signal of Object.keys(SIGNAL_EXIT_CODES)) process.once(signal, stopOnSignal);
+      cleanups.push(() => {
+        for (const signal of Object.keys(SIGNAL_EXIT_CODES)) process.off(signal, stopOnSignal);
+      });
+    }
+    console.log(`design-verify: waiting for ${config.url} (max ${config.serverTimeoutMs}ms)`);
+    // The server's own words say why it never answered (a port in use, a
+    // failed build); a healthy start never prints them.
+    const printServerOutput = async () => {
+      if (server.ended() === undefined) {
+        console.error(
+          `design-verify: the server command is still running and is stopped now; its last output:\n${server.output() || '(no output)'}`,
+        );
+        return;
+      }
+      await server.settled();
+      console.error(`design-verify: the server command's last output:\n${server.output() || '(no output)'}`);
+    };
+    try {
+      await waitForUrl(config.url, { timeoutMs: config.serverTimeoutMs, ended: server?.ended });
+    } catch (error) {
+      if (!server) throw error;
+      console.error(`design-verify: ${error instanceof Error ? error.message : String(error)}`);
+      await printServerOutput();
+      return 2;
+    }
+    // The URL answered, but the precheck above can miss a slow server that
+    // already held it: a command that died on the taken port then leaves that
+    // server to be measured. The run refuses once its own command has ended.
+    const refuseIfServerEnded = async () => {
+      const ended = server && !interrupted ? server.ended() : undefined;
+      if (ended === undefined) return false;
+      console.error(
+        `design-verify: ${config.url} answered, but after the answer the server command this run started ` +
+          `was found ended (${ended}): nothing this run started serves ${config.url} now, so it is not measured. ` +
+          `Run again, or pass --url with a free port`,
+      );
+      await printServerOutput();
+      return true;
+    };
+    // Its exit can arrive just after the answer, so the check is made once
+    // more after a short pause, and again right before the browser attaches.
+    if (server && server.ended() === undefined) await new Promise((r) => setTimeout(r, SERVER_EXIT_RECHECK_MS));
+    if (await refuseIfServerEnded()) return 2;
+
+    let endpoint = config.cdpUrl;
+    if (!endpoint) {
+      const execPath = findChrome({ chromePath: config.chromePath });
+      console.log(`design-verify: launching headless Chrome: ${execPath}`);
+      chromeLaunch = launchChrome(execPath, { timeoutMs: CHROME_LAUNCH_TIMEOUT_MS });
+      const chrome = await chromeLaunch.catch((error) => {
+        if (!interrupted) throw error;
+      });
+      // The only await the signal handler waits on with this path: once a
+      // signal was taken, the handler stops what started and owns the exit
+      // code, so this path must not return or throw ahead of it.
+      if (interrupted) await new Promise(() => {});
+      cleanups.push(chrome.stop);
+      endpoint = chrome.endpoint;
+    }
+    if (await refuseIfServerEnded()) return 2;
+    const session = new CdpSession(await newTarget(endpoint));
+    cleanups.push(() => session.close());
+    await session.connect();
+
+    fs.mkdirSync(config.outDir, { recursive: true });
+    const menuMode = config.menus.length > 0;
+    const states = [];
+    let currentKey = '';
+    for (const state of expandMatrix({ ...config, routes: menuMode ? config.menus : config.routes })) {
+      const { route, theme, width } = state;
+      const pageKey = JSON.stringify([route, theme]);
+      /** @type {StateRecord} */
+      const record = { route, theme, width };
+
+      // A route/theme change reloads the page; width changes reuse it.
+      if (pageKey !== currentKey) {
+        const beforeNav = session.consoleLines.length;
+        await session.navigate(menuMode ? config.url : joinUrl(config.url, route));
+        // The app restores its theme from localStorage at boot, so store it on
+        // the app's origin and reload for it to take effect (the checker
+        // re-sweeps). runner/theme.mjs says which keys and how each state
+        // checks that the theme took.
+        await session.waitForConsoleLine(SWEEP_LINE, beforeNav, config.sweepTimeoutMs);
+        const set = await session.evaluate(themeSeedExpression(config.themeKey, theme));
+        if (set.error) {
+          record.environmentError = `could not set theme: ${set.error}`;
+          states.push(record);
+          continue;
+        }
+        const beforeReload = session.consoleLines.length;
+        await session.send('Page.reload', { ignoreCache: false });
+        const sweepLine = await session.waitForConsoleLine(
+          SWEEP_LINE,
+          beforeReload,
+          config.sweepTimeoutMs,
+        );
+        const failure = session.consoleLines
+          .slice(beforeReload)
+          .find((line) => VERIFY_PKG_FAILURE.test(line));
+        if (failure) {
+          record.environmentError = failure;
+          states.push(record);
+          continue;
+        }
+        if (!sweepLine) {
+          console.warn(
+            `design-verify: no [design-defects] line within ${config.sweepTimeoutMs}ms ` +
+              `at ${route} (${theme}) - attempting on-demand sweep anyway`,
+          );
+        }
+        // Tokens are page-wide: probe the DESIGN.md pairs once per theme, on
+        // the first page that theme loads.
+        if (pairs && !probedThemes.has(theme)) {
+          probedThemes.add(theme);
+          await session.setWidth(width);
+          await new Promise((r) => setTimeout(r, config.settleMs));
+          const applied = await session.evaluate(appliedThemeExpression(config.themeKey));
+          const probe = await session.evaluate(probeExpression(pairs));
+          const contrast = contrastState({
+            theme,
+            width,
+            pairs,
+            applied,
+            themeKey: config.themeKey,
+            probe,
+            spec: contrastSpec,
+            gateFor,
+          });
+          states.push(contrast);
+          console.log(
+            `design-verify: DESIGN.md contrast ${theme} - ` +
+              (contrast.environmentError
+                ? `ENVIRONMENT: ${contrast.environmentError}`
+                : `${contrast.contrast.length} pair(s) measured, ${contrast.findings.length} below threshold` +
+                  (contrast.needsReview.length > 0 ? `, ${contrast.needsReview.length} needing review` : '')),
+          );
+        }
+        if (menuMode) {
+          const activationError = await activateMenu(session, route, config.sweepTimeoutMs);
+          if (activationError) {
+            record.environmentError = activationError;
+            states.push(record);
+            continue;
+          }
+          await new Promise((r) => setTimeout(r, config.settleMs));
+        }
+        currentKey = pageKey;
+      }
+
+      await session.setWidth(width);
+      await new Promise((r) => setTimeout(r, config.settleMs));
+      const before = session.consoleLines.length;
+      const applied = await session.evaluate(appliedThemeExpression(config.themeKey));
+      const sweep = await session.evaluate('window.__frontxDesignDefects()', {
+        awaitPromise: true,
+      });
+      sweepState(record, {
+        applied,
+        themeKey: config.themeKey,
+        sweep,
+        gateFor,
+        waivers: waivers.waivers,
+        coversState,
+      });
+      record.consoleLines = session.consoleLines.slice(before);
+
+      if (config.screenshots) {
+        try {
+          const file = shotName(route, theme, width);
+          fs.writeFileSync(
+            path.join(config.outDir, file),
+            Buffer.from(await session.screenshot(), 'base64'),
+          );
+          record.screenshot = file;
+        } catch (error) {
+          record.screenshotError = error instanceof Error ? error.message : String(error);
+        }
+      }
+      states.push(record);
+      const count = record.findings?.length;
+      const undecided = record.needsReview?.length ?? 0;
+      const waivedCount = record.waived?.length ?? 0;
+      console.log(
+        `design-verify: ${route} ${theme} ${width}px - ` +
+          (record.environmentError
+            ? `ENVIRONMENT: ${record.environmentError}`
+            : count === 0 && undecided === 0
+              ? 'clean'
+              : `${count} finding(s)` + (undecided > 0 ? `, ${undecided} needing review` : '')) +
+          (waivedCount > 0 ? `, ${waivedCount} waived` : '') +
+          (record.screenshotError ? ` - SCREENSHOT FAILED: ${record.screenshotError}` : ''),
+      );
+    }
+
+    // A theme whose every page failed to load was never probed: say so
+    // rather than leave its pairs out of the report.
+    for (const theme of pairs ? config.themes : []) {
+      if (probedThemes.has(theme)) continue;
+      states.push({
+        check: CONTRAST_CHECK,
+        route: 'DESIGN.md',
+        theme,
+        environmentError: 'contrast not measured: no page of this theme loaded',
+      });
+    }
+
+    const report = buildReport(
+      {
+        baseUrl: config.url,
+        themeKey: config.themeKey,
+        waivers: waiverReport(waivers, {
+          mode,
+          gates: reportedGates,
+          exercised: measuredScreens(states),
+          requested: menuMode ? config.menus : config.routes,
+        }),
+      },
+      states,
+    );
+    const diff = baselineReport ? diffReports(baselineReport, report) : undefined;
+    if (diff) report.baselineComparison = { baseline: config.baseline, ...diff };
+    const reportPath = path.join(config.outDir, 'findings.json');
+    fs.writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+    for (const line of summaryLines(report, diff)) console.log(line);
+    console.log(`design-verify: report written to ${reportPath}`);
+    return exitCode(report, config, diff);
+  } finally {
+    for (const cleanup of cleanups.reverse()) cleanup();
+  }
+}
+
+/**
+ * @typedef {{route: string, theme: string, width: number,
+ *   findings?: Array<{id?: string, detail?: string, target?: string}>,
+ *   needsReview?: Array<{id?: string, detail?: string, target?: string}>,
+ *   environmentError?: string, appliedTheme?: string | null, screenshot?: string, screenshotError?: string,
+ *   consoleLines?: string[]}} StateRecord
+ */
+
+if (isEntryPoint(import.meta.url)) {
+  main().then(
+    (code) => process.exit(code),
+    (error) => {
+      console.error(`design-verify: ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(2);
+    },
+  );
+}

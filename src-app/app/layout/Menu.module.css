@@ -1,0 +1,75 @@
+/*
+ * The page links: one row, menu order, 18 px apart. A link is dark navy; the
+ * open page's link is accent blue with a 2 px underline sitting on the
+ * header's bottom line. Phone first: the row scrolls sideways inside its own
+ * strip under the brand row.
+ */
+.list {
+  display: flex;
+  align-items: stretch;
+  gap: var(--app-nav-gap);
+  height: var(--space-12);
+  margin: 0;
+  padding: 0 var(--app-gutter-phone);
+  list-style: none;
+  white-space: nowrap;
+}
+
+.item {
+  display: flex;
+}
+
+.link {
+  position: relative;
+  display: flex;
+  align-items: center;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--app-navy);
+  font-family: inherit;
+  font-size: var(--text-nav-size);
+  font-weight: 450;
+  line-height: var(--text-label-line-height);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.link:hover {
+  color: var(--app-accent);
+}
+
+.link:focus-visible {
+  outline: 2px solid var(--app-accent);
+  outline-offset: var(--space-1);
+  border-radius: var(--radius-xs);
+}
+
+.link[aria-current='page'] {
+  color: var(--app-accent);
+}
+
+/* The underline sits on the header line: 2 px, inside the link's box. */
+.link[aria-current='page']::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  bottom: -1px;
+  left: 0;
+  height: 2px;
+  background-color: var(--app-accent);
+}
+
+.emptyHint {
+  display: flex;
+  align-items: center;
+  color: var(--app-muted);
+  font-size: var(--text-label-size);
+}
+
+@media (min-width: 768px) {
+  .list {
+    height: 100%;
+    padding: 0;
+  }
+}

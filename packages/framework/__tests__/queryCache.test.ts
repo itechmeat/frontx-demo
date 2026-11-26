@@ -1,0 +1,1639 @@
+/**
+ * Tests for queryCache() plugin lifecycle — Phase 5 (implement-endpoint-descriptors)
+ *
+ * Scope: narrow unit tests that exercise the queryCache() / queryCacheShared()
+ * lifecycle, event contract, and shared-retainer invariants. Cross-package
+ * integration via full service / RestEndpointProtocol descriptors is
+ * intentionally out of scope for this feature (see
+ * `architecture/features/feature-request-lifecycle/FEATURE.md` — Non-Applicable
+ * Domains). Plugin wiring with L1 `sharedFetchCache` is asserted only through
+ * the plugin's own public bridge (cache/set/remove/invalidate + mock toggle),
+ * never through real API services.
+ *
+ * @packageDocumentation
+ * @vitest-environment jsdom
+ */
+
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { QueryClient } from '@tanstack/query-core';
+import type { AuthProvider } from '@gears-frontx/auth';
+import type { FrontXApp, FrontXPlugin } from '../src/types';
+
+// One app per runtime: every test loads its own module copy.
+let getSharedFetchCache: typeof import('@gears-frontx/api').getSharedFetchCache;
+let resetSharedFetchCache: typeof import('@gears-frontx/api').resetSharedFetchCache;
+// Every app a test builds comes from its own module copy of createFrontX: the
+// framework allows one build per copy, while these tests deliberately run several
+// plugin runtimes side by side over the globalThis-shared QueryClient.
+const RUNTIME_POOL_SIZE = 8;
+let createFrontXPool: Array<typeof import('../src/createFrontX').createFrontX>;
+function createFrontX(...args: Parameters<typeof import('../src/createFrontX').createFrontX>) {
+  const next = createFrontXPool.shift();
+  if (!next) throw new Error('Test needs more than RUNTIME_POOL_SIZE runtimes.');
+  return next(...args);
+}
+let queryCache: typeof import('../src/plugins/queryCache').queryCache;
+let queryCacheShared: typeof import('../src/plugins/queryCache').queryCacheShared;
+let readQueryCacheScopeGeneration: typeof import('../src/plugins/queryCache').readQueryCacheScopeGeneration;
+type Testing = typeof import('../src/testing');
+let resetSharedQueryClient: Testing['resetSharedQueryClient'];
+let peekSharedQueryClient: Testing['peekSharedQueryClient'];
+let peekSharedQueryClientRetainers: Testing['peekSharedQueryClientRetainers'];
+let peekQueryClientBroadcastTarget: Testing['peekQueryClientBroadcastTarget'];
+let peekAppQueryClient: Testing['peekAppQueryClient'];
+let peekAppQueryClientResolver: Testing['peekAppQueryClientResolver'];
+let peekAppQueryClientActivator: Testing['peekAppQueryClientActivator'];
+let eventBus: typeof import('@gears-frontx/state').eventBus;
+let resetStore: typeof import('@gears-frontx/state').resetStore;
+let MockEvents: typeof import('../src/effects/mockEffects').MockEvents;
+let TenantEvents: typeof import('../src/effects/tenantEffects').TenantEvents;
+let AuthEvents: typeof import('../src/plugins/auth').AuthEvents;
+
+// ============================================================================
+// Test helpers
+// ============================================================================
+
+/**
+ * Real minimal app from the builder — queryCache onInit/onDestroy only attach
+ * symbol metadata; no package plugins are registered.
+ */
+function stubApp(): FrontXApp {
+  return createFrontX().build();
+}
+
+/**
+ * Drain pending plugin work: the destroy teardown awaits cancelQueries()
+ * before clear(), and app builds or settled fetches resolve on microtasks;
+ * yield microtasks + one macrotask so those continuations run.
+ *
+ * Prefer `waitForQueryData(client, key)` (vi.waitFor) for assertions on
+ * observable cache state.
+ */
+async function flushQueryCacheClear(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, 0);
+  });
+}
+
+/** Wait until `client.getQueryData(key)` matches a predicate. */
+async function waitForQueryDataGone(
+  client: QueryClient,
+  key: readonly unknown[]
+): Promise<void> {
+  await vi.waitFor(() => {
+    expect(client.getQueryData(key)).toBeUndefined();
+  });
+}
+
+function createDeferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((resolver) => {
+    resolve = resolver;
+  });
+
+  return { promise, resolve };
+}
+
+/**
+ * Typed stand-in for malformed cache event payloads. Matches the production
+ * event-map key set (`queryKey`, `exact`, `dataOrUpdater`) with every field
+ * optional so tests can deliberately omit required fields without resorting to
+ * `as unknown` double-casts. The queryCache plugin declares strict payload
+ * interfaces on `EventPayloadMap`; this helper narrows the emit surface used
+ * by validation tests.
+ */
+type MalformedCachePayload = {
+  queryKey?: unknown;
+  exact?: boolean;
+  dataOrUpdater?: unknown;
+};
+
+type MalformedCacheEvent = 'cache/invalidate' | 'cache/set' | 'cache/remove';
+
+function emitMalformedCacheEvent(
+  eventType: MalformedCacheEvent,
+  payload: MalformedCachePayload
+): void {
+  // eventBus.emit is typed against EventPayloadMap; the whole point of this
+  // helper is to feed deliberately-wrong shapes through the same runtime path.
+  const emitter = eventBus as unknown as {
+    emit(type: MalformedCacheEvent, payload: MalformedCachePayload): void;
+  };
+  emitter.emit(eventType, payload);
+}
+
+/**
+ * Run a block with `console.error` silenced, guaranteeing restore even when
+ * assertions throw. Avoids cross-test bleed when a test fails mid-flight.
+ */
+async function withSilencedConsoleError<T>(
+  fn: (spy: ReturnType<typeof vi.spyOn>) => Promise<T>
+): Promise<T> {
+  const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    return await fn(spy);
+  } finally {
+    spy.mockRestore();
+  }
+}
+
+function requireSharedQueryClient(): QueryClient {
+  const client = peekSharedQueryClient();
+  if (!client) {
+    throw new Error('expected shared query client');
+  }
+  return client;
+}
+
+function requireBroadcastTarget(client: QueryClient): string {
+  const target = peekQueryClientBroadcastTarget(client);
+  if (!target) {
+    throw new Error('expected query client broadcast target');
+  }
+  return target;
+}
+
+// ============================================================================
+// Setup / Teardown
+// ============================================================================
+
+beforeEach(async () => {
+  createFrontXPool = [];
+  for (let i = 0; i < RUNTIME_POOL_SIZE; i += 1) {
+    vi.resetModules();
+    createFrontXPool.push((await import('../src/createFrontX')).createFrontX);
+  }
+  vi.resetModules();
+  ({ getSharedFetchCache, resetSharedFetchCache } = await import('@gears-frontx/api'));
+  ({ queryCache, queryCacheShared, readQueryCacheScopeGeneration } = await import('../src/plugins/queryCache'));
+  ({
+    resetSharedQueryClient,
+    peekSharedQueryClient,
+    peekSharedQueryClientRetainers,
+    peekQueryClientBroadcastTarget,
+    peekAppQueryClient,
+    peekAppQueryClientResolver,
+    peekAppQueryClientActivator,
+  } = await import('../src/testing'));
+  ({ eventBus, resetStore } = await import('@gears-frontx/state'));
+  ({ MockEvents } = await import('../src/effects/mockEffects'));
+  ({ TenantEvents } = await import('../src/effects/tenantEffects'));
+  ({ AuthEvents } = await import('../src/plugins/auth'));
+  resetStore();
+  resetSharedFetchCache();
+  resetSharedQueryClient();
+});
+
+afterEach(() => {
+  // Clear listeners accumulated by tested plugins so they don't bleed across tests.
+  eventBus.clearAll();
+  resetSharedFetchCache();
+  resetSharedQueryClient();
+  resetStore();
+  vi.restoreAllMocks();
+});
+
+// ============================================================================
+// Plugin shape
+// ============================================================================
+
+describe('queryCache() — plugin shape', () => {
+  it('returns an object with name "queryCache"', () => {
+    const plugin: FrontXPlugin = queryCache();
+    expect(plugin.name).toBe('queryCache');
+  });
+
+  it('does not retain the shared QueryClient until onInit', () => {
+    queryCache();
+    expect(peekSharedQueryClient()).toBeUndefined();
+    expect(peekSharedQueryClientRetainers()).toBe(0);
+  });
+
+  it('onDestroy without onInit does not retain the shared QueryClient', () => {
+    const plugin = queryCache();
+    plugin.onDestroy!(stubApp());
+    expect(peekSharedQueryClient()).toBeUndefined();
+    expect(peekSharedQueryClientRetainers()).toBe(0);
+  });
+
+  it('creates a shared QueryClient on onInit', () => {
+    const plugin = queryCache();
+    plugin.onInit!(stubApp());
+    expect(requireSharedQueryClient()).toBeInstanceOf(QueryClient);
+  });
+
+  it('exposes a broadcast target token for local cache event fan-out', () => {
+    const plugin = queryCache();
+    plugin.onInit!(stubApp());
+
+    expect(requireBroadcastTarget(requireSharedQueryClient())).toMatch(/^query-cache-/);
+  });
+
+  it('assigns a fresh broadcast target after the shared client is reset', () => {
+    const firstPlugin = queryCache();
+    firstPlugin.onInit!(stubApp());
+    const firstTarget = requireBroadcastTarget(requireSharedQueryClient());
+
+    resetSharedQueryClient();
+
+    const secondPlugin = queryCache();
+    secondPlugin.onInit!(stubApp());
+    const secondTarget = requireBroadcastTarget(requireSharedQueryClient());
+
+    expect(firstTarget).not.toBe(secondTarget);
+  });
+
+  it('has onInit and onDestroy lifecycle hooks', () => {
+    const plugin = queryCache();
+    expect(typeof plugin.onInit).toBe('function');
+    expect(typeof plugin.onDestroy).toBe('function');
+  });
+
+  it('queryCacheShared() joins the shared QueryClient', () => {
+    const hostPlugin = queryCache();
+    const sharedPlugin: FrontXPlugin = queryCacheShared();
+
+    expect(sharedPlugin.name).toBe('queryCacheShared');
+
+    hostPlugin.onInit?.(stubApp());
+    sharedPlugin.onInit?.(stubApp());
+
+    const hostClient = requireSharedQueryClient();
+    expect(peekSharedQueryClient()).toBe(hostClient);
+    expect(requireBroadcastTarget(hostClient)).toBe(requireBroadcastTarget(hostClient));
+
+    sharedPlugin.onDestroy?.(stubApp());
+    hostPlugin.onDestroy?.(stubApp());
+  });
+
+  it('queryCacheShared() joins a host QueryClient created with custom config', () => {
+    const hostPlugin = queryCache({ staleTime: 60_000 });
+    const sharedPlugin: FrontXPlugin = queryCacheShared();
+
+    hostPlugin.onInit?.(stubApp());
+    sharedPlugin.onInit?.(stubApp());
+
+    const client = requireSharedQueryClient();
+    expect(client.getDefaultOptions().queries?.staleTime).toBe(60_000);
+
+    sharedPlugin.onDestroy?.(stubApp());
+    hostPlugin.onDestroy?.(stubApp());
+  });
+
+  it('queryCacheShared() can build before the host runtime and join later', async () => {
+    const childApp = createFrontX().use(queryCacheShared()).build();
+
+    expect(peekAppQueryClient(childApp)).toBeUndefined();
+    expect(peekAppQueryClientResolver(childApp)?.()).toBeUndefined();
+    expect(typeof peekAppQueryClientActivator(childApp)).toBe('function');
+
+    const hostApp = createFrontX().use(queryCache()).build();
+    const sharedClient = peekAppQueryClientActivator(childApp)?.();
+
+    const hostClient = peekAppQueryClient(hostApp);
+    expect(sharedClient).toBe(hostClient);
+    expect(peekAppQueryClient(childApp)).toBe(hostClient);
+    expect(peekAppQueryClientResolver(childApp)?.()).toBe(hostClient);
+
+    childApp.destroy();
+    hostApp.destroy();
+    await flushQueryCacheClear();
+  });
+
+  it('reuses the same QueryClient across host plugins with matching config', () => {
+    const hostPlugin = queryCache();
+    const siblingHostPlugin = queryCache();
+
+    siblingHostPlugin.onInit?.(stubApp());
+    hostPlugin.onInit?.(stubApp());
+
+    const hostClient = requireSharedQueryClient();
+    expect(hostClient).toBeDefined();
+
+    siblingHostPlugin.onDestroy?.(stubApp());
+    hostPlugin.onDestroy?.(stubApp());
+  });
+
+  it('rejects conflicting queryCache() configs once the shared client exists', () => {
+    const hostPlugin = queryCache({ staleTime: 60_000 });
+    hostPlugin.onInit?.(stubApp());
+
+    const conflicting = queryCache({ staleTime: 30_000 });
+    expect(() => {
+      conflicting.onInit?.(stubApp());
+    }).toThrow(
+      '[Gears FrontX] queryCache() received a config that conflicts with the existing shared QueryClient.'
+    );
+
+    hostPlugin.onDestroy?.(stubApp());
+  });
+
+  it('builder skips duplicate queryCache() registrations without leaking shared retainers', async () => {
+    const firstCache = getSharedFetchCache();
+    const app = createFrontX().use(queryCache()).use(queryCache()).build();
+
+    app.destroy();
+    await flushQueryCacheClear();
+
+    expect(peekSharedQueryClient()).toBeUndefined();
+    expect(getSharedFetchCache()).not.toBe(firstCache);
+  });
+
+  it('builder skips duplicate queryCacheShared() registrations without leaking shared retainers', async () => {
+    const firstCache = getSharedFetchCache();
+    const app = createFrontX()
+      .use(queryCache())
+      .use(queryCacheShared())
+      .use(queryCacheShared())
+      .build();
+
+    app.destroy();
+    await flushQueryCacheClear();
+
+    expect(peekSharedQueryClient()).toBeUndefined();
+    expect(getSharedFetchCache()).not.toBe(firstCache);
+  });
+});
+
+// ============================================================================
+// Runtime default options
+// ============================================================================
+
+describe('queryCache() — runtime default options', () => {
+  it('creates runtime with staleTime 30_000 by default', () => {
+    const plugin = queryCache();
+    plugin.onInit!(stubApp());
+    const client = requireSharedQueryClient();
+
+    const defaults = client.getDefaultOptions();
+    expect(defaults.queries?.staleTime).toBe(30_000);
+  });
+
+  it('creates runtime with gcTime 300_000 by default', () => {
+    const plugin = queryCache();
+    plugin.onInit!(stubApp());
+    const client = requireSharedQueryClient();
+
+    const defaults = client.getDefaultOptions();
+    expect(defaults.queries?.gcTime).toBe(300_000);
+  });
+
+  it('creates runtime with retry 0 by default', () => {
+    const plugin = queryCache();
+    plugin.onInit!(stubApp());
+    const client = requireSharedQueryClient();
+
+    const defaults = client.getDefaultOptions();
+    expect(defaults.queries?.retry).toBe(0);
+  });
+
+  it('creates runtime with refetchOnWindowFocus true by default', () => {
+    const plugin = queryCache();
+    plugin.onInit!(stubApp());
+    const client = requireSharedQueryClient();
+
+    const defaults = client.getDefaultOptions();
+    expect(defaults.queries?.refetchOnWindowFocus).toBe(true);
+  });
+});
+
+// ============================================================================
+// Custom config overrides
+// ============================================================================
+
+describe('queryCache(config) — custom config overrides', () => {
+  it('custom staleTime overrides default', () => {
+    const plugin = queryCache({ staleTime: 60_000 });
+    plugin.onInit!(stubApp());
+    const client = requireSharedQueryClient();
+
+    expect(client.getDefaultOptions().queries?.staleTime).toBe(60_000);
+  });
+
+  it('custom gcTime overrides default', () => {
+    const plugin = queryCache({ gcTime: 600_000 });
+    plugin.onInit!(stubApp());
+    const client = requireSharedQueryClient();
+
+    expect(client.getDefaultOptions().queries?.gcTime).toBe(600_000);
+  });
+
+  it('refetchOnWindowFocus: false overrides default', () => {
+    const plugin = queryCache({ refetchOnWindowFocus: false });
+    plugin.onInit!(stubApp());
+    const client = requireSharedQueryClient();
+
+    expect(client.getDefaultOptions().queries?.refetchOnWindowFocus).toBe(false);
+  });
+
+  it('partial config leaves unspecified options at their defaults', () => {
+    const plugin = queryCache({ staleTime: 0 });
+    plugin.onInit!(stubApp());
+    const client = requireSharedQueryClient();
+    const defaults = client.getDefaultOptions();
+
+    expect(defaults.queries?.staleTime).toBe(0);
+    expect(defaults.queries?.gcTime).toBe(300_000);
+    expect(defaults.queries?.retry).toBe(0);
+  });
+});
+
+// ============================================================================
+// onInit — event subscriptions
+// ============================================================================
+
+describe('queryCache() — onInit subscribes to events', () => {
+  it('onInit installs the shared runtime and MockEvents.Toggle listener', async () => {
+    const plugin = queryCache();
+    const onSpy = vi.spyOn(eventBus, 'on');
+
+    plugin.onInit!(stubApp());
+
+    expect(peekSharedQueryClient()).toBeInstanceOf(QueryClient);
+    expect(peekSharedQueryClientRetainers()).toBe(1);
+    // Observe the subscription via eventBus.on() rather than the absent
+    // listenerCount() API: the plugin must register a handler for the toggle
+    // event during onInit.
+    expect(onSpy).toHaveBeenCalledWith(MockEvents.Toggle, expect.any(Function));
+
+    // Extra proof the listener is actually live: toggling mock mode should
+    // drain the cache instead of throwing.
+    const client = requireSharedQueryClient();
+    client.setQueryData(['toggle-sentinel'], 'value');
+    eventBus.emit(MockEvents.Toggle, { enabled: true });
+    await waitForQueryDataGone(client, ['toggle-sentinel']);
+  });
+
+  it('MockEvents.Toggle on an empty cache does not fail and leaves the client usable', async () => {
+    const plugin = queryCache();
+    plugin.onInit!(stubApp());
+    const client = requireSharedQueryClient();
+    const consoleError = vi.spyOn(console, 'error');
+
+    eventBus.emit(MockEvents.Toggle, { enabled: true });
+    await flushQueryCacheClear();
+    expect(consoleError).not.toHaveBeenCalled();
+
+    // Listener is still alive — seeding + firing again still clears.
+    client.setQueryData(['later'], 'value');
+    eventBus.emit(MockEvents.Toggle, { enabled: false });
+    await waitForQueryDataGone(client, ['later']);
+  });
+
+  it('cache/invalidate against an empty cache does not fail and the listener stays armed', () => {
+    const plugin = queryCache();
+    plugin.onInit!(stubApp());
+    const client = requireSharedQueryClient();
+    const consoleError = vi.spyOn(console, 'error');
+
+    eventBus.emit('cache/invalidate', { queryKey: ['someKey'] });
+    expect(consoleError).not.toHaveBeenCalled();
+
+    // Seed post-hoc and re-emit — listener still invalidates.
+    client.setQueryData(['someKey'], 'value');
+    eventBus.emit('cache/invalidate', { queryKey: ['someKey'] });
+    expect(client.getQueryState(['someKey'])?.isInvalidated).toBe(true);
+  });
+
+  it('onInit creates the shared fetch cache', () => {
+    const plugin = queryCache();
+    plugin.onInit!(stubApp());
+
+    expect(getSharedFetchCache()).toBeDefined();
+  });
+});
+
+// ============================================================================
+// MockEvents.Toggle — clears cache
+// ============================================================================
+
+describe('queryCache() — MockEvents.Toggle clears the cache', () => {
+  it('clears all cached data when MockEvents.Toggle fires', async () => {
+    const plugin = queryCache();
+    plugin.onInit!(stubApp());
+    const client = requireSharedQueryClient();
+
+    client.setQueryData(['users'], [{ id: 1 }]);
+    client.setQueryData(['profile'], { name: 'Alice' });
+
+    expect(client.getQueryData(['users'])).toBeDefined();
+    expect(client.getQueryData(['profile'])).toBeDefined();
+
+    eventBus.emit(MockEvents.Toggle, { enabled: true });
+
+    await waitForQueryDataGone(client, ['users']);
+    await waitForQueryDataGone(client, ['profile']);
+  });
+
+  it('keeps the cache when a toggle repeats the mode already in force', async () => {
+    const plugin = queryCache();
+    plugin.onInit!(stubApp());
+    const client = requireSharedQueryClient();
+    const sharedFetchCache = getSharedFetchCache();
+    const fetcher = vi.fn().mockResolvedValue('first');
+
+    // Mock mode starts off: a toggle to "off" changes nothing.
+    client.setQueryData(['key'], 'value');
+    await sharedFetchCache.getOrFetch(['shared'], fetcher, { staleTime: 1_000 });
+    eventBus.emit(MockEvents.Toggle, { enabled: false });
+    await flushQueryCacheClear();
+    expect(client.getQueryData(['key'])).toBe('value');
+    await sharedFetchCache.getOrFetch(['shared'], fetcher, { staleTime: 1_000 });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+
+    eventBus.emit(MockEvents.Toggle, { enabled: true });
+    await waitForQueryDataGone(client, ['key']);
+
+    // A second mock() runtime enabling mock mode by default re-emits "on".
+    client.setQueryData(['key'], 'value');
+    eventBus.emit(MockEvents.Toggle, { enabled: true });
+    await flushQueryCacheClear();
+    expect(client.getQueryData(['key'])).toBe('value');
+  });
+
+  it('takes the starting mode from the store when the mock slice is registered', async () => {
+    const { createStore, registerSlice, getStore } = await import('@gears-frontx/state');
+    const { mockSlice, setMockEnabled } = await import('../src/slices/mockSlice');
+    createStore({});
+    registerSlice(mockSlice);
+    getStore().dispatch(setMockEnabled(true));
+
+    const plugin = queryCache();
+    plugin.onInit!(stubApp());
+    const client = requireSharedQueryClient();
+
+    client.setQueryData(['key'], 'value');
+    eventBus.emit(MockEvents.Toggle, { enabled: true });
+    await flushQueryCacheClear();
+    expect(client.getQueryData(['key'])).toBe('value');
+
+    eventBus.emit(MockEvents.Toggle, { enabled: false });
+    await waitForQueryDataGone(client, ['key']);
+  });
+
+  it('a host that rejoins clears data cached under a mode that changed while no host was present', async () => {
+    const { createStore, registerSlice, getStore } = await import('@gears-frontx/state');
+    const { mockSlice, setMockEnabled } = await import('../src/slices/mockSlice');
+    createStore({});
+    registerSlice(mockSlice);
+
+    const firstHost = queryCache();
+    const sharedPlugin = queryCacheShared();
+    firstHost.onInit!(stubApp());
+    sharedPlugin.onInit!(stubApp());
+    const client = requireSharedQueryClient();
+    firstHost.onDestroy!(stubApp());
+    await flushQueryCacheClear();
+
+    // Fetched under mock off; then mock mode turns on with no host listening.
+    client.setQueryData(['key'], 'real');
+    getStore().dispatch(setMockEnabled(true));
+    eventBus.emit(MockEvents.Toggle, { enabled: true });
+    await flushQueryCacheClear();
+    expect(client.getQueryData(['key'])).toBe('real');
+
+    const secondHost = queryCache();
+    secondHost.onInit!(stubApp());
+    await waitForQueryDataGone(client, ['key']);
+
+    // The rejoined host keeps the startup-repeat rule.
+    client.setQueryData(['key'], 'mock');
+    eventBus.emit(MockEvents.Toggle, { enabled: true });
+    await flushQueryCacheClear();
+    expect(client.getQueryData(['key'])).toBe('mock');
+
+    secondHost.onDestroy!(stubApp());
+    sharedPlugin.onDestroy!(stubApp());
+    await flushQueryCacheClear();
+  });
+
+  it('a host that rejoins clears data cached during a mode round trip while no host was present', async () => {
+    const hostPlugin = queryCache();
+    const sharedPlugin = queryCacheShared();
+    hostPlugin.onInit!(stubApp());
+    sharedPlugin.onInit!(stubApp());
+    const client = requireSharedQueryClient();
+    hostPlugin.onDestroy!(stubApp());
+    await flushQueryCacheClear();
+
+    eventBus.emit(MockEvents.Toggle, { enabled: true });
+    client.setQueryData(['key'], 'mock');
+    eventBus.emit(MockEvents.Toggle, { enabled: false });
+    await flushQueryCacheClear();
+    expect(client.getQueryData(['key'])).toBe('mock');
+
+    const nextHost = queryCache();
+    nextHost.onInit!(stubApp());
+    await waitForQueryDataGone(client, ['key']);
+
+    nextHost.onDestroy!(stubApp());
+    sharedPlugin.onDestroy!(stubApp());
+    await flushQueryCacheClear();
+  });
+
+  it('clears the shared fetch cache on mock toggle', async () => {
+    const plugin = queryCache();
+    const sharedFetchCache = getSharedFetchCache();
+    const fetcher = vi.fn().mockResolvedValue('first');
+
+    await sharedFetchCache.getOrFetch(['shared'], fetcher, { staleTime: 1_000 });
+    plugin.onInit!(stubApp());
+
+    eventBus.emit(MockEvents.Toggle, { enabled: true });
+    await flushQueryCacheClear();
+
+    await sharedFetchCache.getOrFetch(['shared'], fetcher, { staleTime: 1_000 });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it('still clears runtime and shared fetch cache when cancellation fails', async () => {
+    await withSilencedConsoleError(async (consoleErrorSpy) => {
+      const plugin = queryCache();
+      plugin.onInit!(stubApp());
+      const client = requireSharedQueryClient();
+      const sharedFetchCache = getSharedFetchCache();
+      const fetcher = vi.fn().mockResolvedValue('first');
+      const clearSpy = vi.spyOn(client, 'clear');
+      const sharedClearSpy = vi.spyOn(sharedFetchCache, 'clear');
+
+      const cancelQueriesSpy = vi
+        .spyOn(client, 'cancelQueries')
+        .mockRejectedValue(new Error('cancel failed'));
+      await sharedFetchCache.getOrFetch(['shared'], fetcher, { staleTime: 1_000 });
+
+      eventBus.emit(MockEvents.Toggle, { enabled: true });
+      await flushQueryCacheClear();
+
+      expect(cancelQueriesSpy).toHaveBeenCalledTimes(1);
+      expect(clearSpy).toHaveBeenCalledTimes(1);
+      expect(sharedClearSpy).toHaveBeenCalledTimes(1);
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        '[Gears FrontX] Failed to cancel queries after a mock, tenant or session change',
+        expect.any(Error)
+      );
+
+      await sharedFetchCache.getOrFetch(['shared'], fetcher, { staleTime: 1_000 });
+      expect(fetcher).toHaveBeenCalledTimes(2);
+    });
+  });
+});
+
+// ============================================================================
+// Tenant switch and logout: same rule as a mock mode change
+// ============================================================================
+
+describe('clears the cache on every cache scope change', () => {
+  type ScopeChange = { name: string; change: () => void };
+
+  const scopeChanges: ScopeChange[] = [
+    {
+      name: 'a tenant switch',
+      change: () => eventBus.emit(TenantEvents.Changed, { tenant: { id: 'tenant-b' } }),
+    },
+    { name: 'a tenant clear', change: () => eventBus.emit(TenantEvents.Cleared, {}) },
+    { name: 'a logout', change: () => eventBus.emit(AuthEvents.LoggedOut, {}) },
+    { name: 'a login', change: () => eventBus.emit(AuthEvents.LoggedIn, {}) },
+  ];
+
+  /** Data and a shared fetch entry cached for tenant-a. */
+  async function seedForTenantA(client: QueryClient, fetcher: () => Promise<string>): Promise<void> {
+    eventBus.emit(TenantEvents.Changed, { tenant: { id: 'tenant-a' } });
+    await flushQueryCacheClear();
+    client.setQueryData(['users'], [{ id: 1 }]);
+    await getSharedFetchCache().getOrFetch(['shared'], fetcher, { staleTime: 1_000 });
+  }
+
+  it.each([
+    ...scopeChanges,
+    { name: 'a mock toggle', change: () => eventBus.emit(MockEvents.Toggle, { enabled: true }) },
+  ])('drops old data at once on $name and keeps data written before cancellation settles', async ({ change }) => {
+    const plugin = queryCache();
+    plugin.onInit!(stubApp());
+    const client = requireSharedQueryClient();
+    const fetcher = vi.fn().mockResolvedValue('first');
+    await seedForTenantA(client, fetcher);
+    let resolveOldFetch!: (value: string) => void;
+    const oldFetch = client
+      .fetchQuery({
+        queryKey: ['in-flight'],
+        queryFn: () =>
+          new Promise<string>((resolve) => {
+            resolveOldFetch = resolve;
+          }),
+      })
+      .catch(() => undefined);
+    const cancellation = createDeferred();
+    vi.spyOn(client, 'cancelQueries').mockImplementation(() => cancellation.promise);
+
+    change();
+
+    expect(client.getQueryData(['users'])).toBeUndefined();
+    await getSharedFetchCache().getOrFetch(['shared'], fetcher, { staleTime: 1_000 });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+
+    client.setQueryData(['users'], [{ id: 2 }]);
+    resolveOldFetch('old scope');
+    await oldFetch;
+    await flushQueryCacheClear();
+    expect(client.getQueryData(['in-flight'])).toBeUndefined();
+
+    cancellation.resolve();
+    await flushQueryCacheClear();
+    expect(client.getQueryData(['users'])).toEqual([{ id: 2 }]);
+  });
+
+  it.each([
+    { ...scopeChanges[0], event: () => TenantEvents.Changed },
+    { ...scopeChanges[2], event: () => AuthEvents.LoggedOut },
+    {
+      name: 'a mock toggle',
+      change: () => eventBus.emit(MockEvents.Toggle, { enabled: true }),
+      event: () => MockEvents.Toggle,
+    },
+  ])('clears on $name even when a subscriber registered before queryCache() throws', async ({ change, event }) => {
+    await withSilencedConsoleError(async () => {
+      eventBus.on(event(), () => {
+        throw new Error('subscriber failed');
+      });
+      const plugin = queryCache();
+      plugin.onInit!(stubApp());
+      const client = requireSharedQueryClient();
+      await seedForTenantA(client, vi.fn().mockResolvedValue('first'));
+
+      change();
+
+      expect(client.getQueryData(['users'])).toBeUndefined();
+    });
+  });
+
+  it('keeps the cache when a tenant event does not change the tenant', async () => {
+    const plugin = queryCache();
+    plugin.onInit!(stubApp());
+    const client = requireSharedQueryClient();
+
+    // No tenant yet: a clear changes nothing.
+    client.setQueryData(['users'], [{ id: 1 }]);
+    eventBus.emit(TenantEvents.Cleared, {});
+    await flushQueryCacheClear();
+    expect(client.getQueryData(['users'])).toEqual([{ id: 1 }]);
+
+    await seedForTenantA(client, vi.fn().mockResolvedValue('first'));
+    eventBus.emit(TenantEvents.Changed, { tenant: { id: 'tenant-a' } });
+    await flushQueryCacheClear();
+    expect(client.getQueryData(['users'])).toEqual([{ id: 1 }]);
+  });
+
+  it.each(scopeChanges)(
+    'a host that joins clears data cached before $name while no host was present',
+    async ({ change }) => {
+      const firstHost = queryCache();
+      const sharedPlugin = queryCacheShared();
+      firstHost.onInit!(stubApp());
+      sharedPlugin.onInit!(stubApp());
+      const client = requireSharedQueryClient();
+      await seedForTenantA(client, vi.fn().mockResolvedValue('first'));
+      firstHost.onDestroy!(stubApp());
+      await flushQueryCacheClear();
+
+      // Only the child runtime holds the client: it never clears, but the
+      // change still moves the scope generation.
+      const generationBefore = readQueryCacheScopeGeneration(client);
+      change();
+      await flushQueryCacheClear();
+      expect(client.getQueryData(['users'])).toEqual([{ id: 1 }]);
+      expect(readQueryCacheScopeGeneration(client)).toBe(generationBefore + 1);
+
+      const nextHost = queryCache();
+      nextHost.onInit!(stubApp());
+      await waitForQueryDataGone(client, ['users']);
+
+      nextHost.onDestroy!(stubApp());
+      sharedPlugin.onDestroy!(stubApp());
+      await flushQueryCacheClear();
+    }
+  );
+
+  it('clears through createFrontX() on changeTenant, clearTenantAction and app.auth.logout', async () => {
+    // Same module graph as queryCache, eventBus and the store the tests read.
+    const { createFrontX: createFrontXInGraph } = await import('../src/createFrontX');
+    const { auth } = await import('../src/plugins/auth');
+    const { changeTenant, clearTenantAction } = await import('../src/effects/tenantActions');
+    const provider = {
+      getSession: vi.fn().mockResolvedValue(null),
+      checkAuth: vi.fn().mockResolvedValue({ authenticated: true }),
+      logout: vi.fn().mockResolvedValue({ type: 'none' }),
+    };
+    const app = createFrontXInGraph().use(queryCache()).use(auth({ provider })).build();
+    const client = requireSharedQueryClient();
+
+    changeTenant({ id: 'tenant-a' });
+    await flushQueryCacheClear();
+    client.setQueryData(['users'], 'tenant-a');
+    changeTenant({ id: 'tenant-b' });
+    await waitForQueryDataGone(client, ['users']);
+
+    client.setQueryData(['users'], 'tenant-b');
+    clearTenantAction();
+    await waitForQueryDataGone(client, ['users']);
+
+    client.setQueryData(['users'], 'signed-in');
+    await app.auth?.logout();
+    await waitForQueryDataGone(client, ['users']);
+
+    app.destroy();
+    await flushQueryCacheClear();
+  });
+
+  it('clears through createFrontX() when app.auth.login or app.auth.handleCallback switches the account', async () => {
+    const { createFrontX: createFrontXInGraph } = await import('../src/createFrontX');
+    const { auth } = await import('../src/plugins/auth');
+    const provider = {
+      getSession: vi.fn().mockResolvedValue(null),
+      checkAuth: vi.fn().mockResolvedValue({ authenticated: true }),
+      logout: vi.fn().mockResolvedValue({ type: 'none' }),
+      login: vi.fn().mockResolvedValue({ type: 'none' }),
+      handleCallback: vi.fn().mockResolvedValue({ type: 'none' }),
+    };
+    const app = createFrontXInGraph().use(queryCache()).use(auth({ provider })).build();
+    const client = requireSharedQueryClient();
+
+    client.setQueryData(['users'], 'account-a');
+    await app.auth?.login?.({ type: 'password', payload: { user: 'b' } });
+    expect(client.getQueryData(['users'])).toBeUndefined();
+
+    client.setQueryData(['users'], 'account-b');
+    await app.auth?.handleCallback?.({ params: { code: 'c' } });
+    expect(client.getQueryData(['users'])).toBeUndefined();
+
+    app.destroy();
+    await flushQueryCacheClear();
+  });
+
+  it('clears through createFrontX() when the auth provider ends or switches the session on its own', async () => {
+    const { createFrontX: createFrontXInGraph } = await import('../src/createFrontX');
+    const { auth } = await import('../src/plugins/auth');
+    type Listener = Parameters<NonNullable<AuthProvider['subscribe']>>[0];
+    let listener: Listener | null = null;
+    let sub = 'account-a';
+    const provider: AuthProvider = {
+      getSession: vi.fn().mockResolvedValue(null),
+      checkAuth: vi.fn().mockResolvedValue({ authenticated: true }),
+      logout: vi.fn().mockResolvedValue({ type: 'none' }),
+      getIdentity: vi.fn(async () => ({ sub })),
+      subscribe: (next) => {
+        listener = next;
+        return () => {
+          listener = null;
+        };
+      },
+    };
+    const push = (state: 'authenticated' | 'unauthenticated') => listener?.({ state });
+    const app = createFrontXInGraph().use(queryCache()).use(auth({ provider })).build();
+    const client = requireSharedQueryClient();
+    push('authenticated');
+    await flushQueryCacheClear();
+
+    client.setQueryData(['users'], 'account-a');
+    push('unauthenticated');
+    await waitForQueryDataGone(client, ['users']);
+
+    push('authenticated');
+    await flushQueryCacheClear();
+    client.setQueryData(['users'], 'account-a');
+    sub = 'account-b';
+    push('authenticated');
+    await waitForQueryDataGone(client, ['users']);
+
+    app.destroy();
+    await flushQueryCacheClear();
+  });
+});
+
+describe('queryCache() with mock() through the builder', () => {
+  type PluginOrder = 'queryCache before mock' | 'mock before queryCache';
+
+  async function loadMockPlugins() {
+    const { effects } = await import('../src/plugins/effects');
+    const { mock } = await import('../src/plugins/mock');
+    return { effects, mock };
+  }
+
+  async function buildHostWithMockOnByDefault(order: PluginOrder): Promise<FrontXApp> {
+    // Same module graph as queryCache, eventBus and the store the tests read.
+    const { createFrontX: createFrontXInGraph } = await import('../src/createFrontX');
+    const { effects, mock } = await loadMockPlugins();
+    const mockPlugin = mock({ enabledByDefault: true });
+    const builder = createFrontXInGraph().use(effects());
+    return order === 'queryCache before mock'
+      ? builder.use(queryCache()).use(mockPlugin).build()
+      : builder.use(mockPlugin).use(queryCache()).build();
+  }
+
+  /**
+   * A child runtime (an MFE) in its own module copy that shares the test's
+   * `@gears-frontx/state`, the way production shares the event bus and store.
+   */
+  async function buildChildWithMockOnByDefault(): Promise<FrontXApp> {
+    const sharedState = await import('@gears-frontx/state');
+    vi.resetModules();
+    vi.doMock('@gears-frontx/state', () => sharedState);
+    try {
+      const { createFrontX: createFrontXInChild } = await import('../src/createFrontX');
+      const { queryCacheShared: queryCacheSharedInChild } = await import('../src/plugins/queryCache');
+      const { effects, mock } = await loadMockPlugins();
+      return createFrontXInChild()
+        .use(effects())
+        .use(mock({ enabledByDefault: true }))
+        .use(queryCacheSharedInChild())
+        .build();
+    } finally {
+      vi.doUnmock('@gears-frontx/state');
+    }
+  }
+
+  it.each<PluginOrder>(['queryCache before mock', 'mock before queryCache'])(
+    'keeps host data when a child runtime with mock on by default starts, clears on a real toggle (%s)',
+    async (order) => {
+      const host = await buildHostWithMockOnByDefault(order);
+      await flushQueryCacheClear();
+      const client = requireSharedQueryClient();
+      client.setQueryData(['users'], [{ id: 1 }]);
+
+      const child = await buildChildWithMockOnByDefault();
+      await flushQueryCacheClear();
+      expect(client.getQueryData(['users'])).toEqual([{ id: 1 }]);
+
+      host.actions.toggleMockMode(false);
+      await waitForQueryDataGone(client, ['users']);
+
+      child.destroy();
+      host.destroy();
+      await flushQueryCacheClear();
+    }
+  );
+});
+
+// ============================================================================
+// cache/invalidate event — marks queries stale
+// ============================================================================
+
+describe('queryCache() — cache/invalidate invalidates query keys', () => {
+  it('marks the specified query key as invalidated', () => {
+    const plugin = queryCache({ gcTime: 300_000 });
+    plugin.onInit!(stubApp());
+    const client = requireSharedQueryClient();
+
+    client.setQueryData(['entity', 42], { value: 'original' });
+
+    eventBus.emit('cache/invalidate', { queryKey: ['entity', 42] });
+
+    const state = client.getQueryState(['entity', 42]);
+    expect(state?.isInvalidated).toBe(true);
+  });
+
+  it('does not affect unrelated cache keys', () => {
+    const plugin = queryCache({ gcTime: 300_000 });
+    plugin.onInit!(stubApp());
+    const client = requireSharedQueryClient();
+
+    client.setQueryData(['target'], 'will be invalidated');
+    client.setQueryData(['unrelated'], 'should stay fresh');
+
+    eventBus.emit('cache/invalidate', { queryKey: ['target'] });
+
+    expect(client.getQueryState(['target'])?.isInvalidated).toBe(true);
+    expect(client.getQueryState(['unrelated'])?.isInvalidated).toBeFalsy();
+  });
+
+  it('invalidates descendant shared fetch cache entries when exact is false', async () => {
+    const plugin = queryCache();
+    const sharedFetchCache = getSharedFetchCache();
+    const parentFetcher = vi
+      .fn()
+      .mockResolvedValueOnce('parent-first')
+      .mockResolvedValueOnce('parent-second');
+    const childFetcher = vi
+      .fn()
+      .mockResolvedValueOnce('child-first')
+      .mockResolvedValueOnce('child-second');
+
+    await sharedFetchCache.getOrFetch(['entity'], parentFetcher, { staleTime: 1_000 });
+    await sharedFetchCache.getOrFetch(['entity', { page: 1 }], childFetcher, {
+      staleTime: 1_000,
+    });
+    plugin.onInit!(stubApp());
+
+    eventBus.emit('cache/invalidate', { queryKey: ['entity'], exact: false });
+
+    await sharedFetchCache.getOrFetch(['entity'], parentFetcher, { staleTime: 1_000 });
+    await sharedFetchCache.getOrFetch(['entity', { page: 1 }], childFetcher, {
+      staleTime: 1_000,
+    });
+
+    expect(parentFetcher).toHaveBeenCalledTimes(2);
+    expect(childFetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it('ignores malformed cache/invalidate events that omit queryKey', async () => {
+    const plugin = queryCache({ gcTime: 300_000 });
+    plugin.onInit!(stubApp());
+    const client = requireSharedQueryClient();
+    const sharedFetchCache = getSharedFetchCache();
+    const fetcher = vi.fn().mockResolvedValue('cached');
+
+    client.setQueryData(['target'], 'target');
+    client.setQueryData(['unrelated'], 'unrelated');
+    await sharedFetchCache.getOrFetch(['target'], fetcher, { staleTime: 1_000 });
+
+    emitMalformedCacheEvent('cache/invalidate', {});
+
+    expect(client.getQueryState(['target'])?.isInvalidated).toBeFalsy();
+    expect(client.getQueryState(['unrelated'])?.isInvalidated).toBeFalsy();
+
+    await sharedFetchCache.getOrFetch(['target'], fetcher, { staleTime: 1_000 });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores broad cache/invalidate events with an empty queryKey', async () => {
+    const plugin = queryCache({ gcTime: 300_000 });
+    plugin.onInit!(stubApp());
+    const client = requireSharedQueryClient();
+    const sharedFetchCache = getSharedFetchCache();
+    const fetcher = vi.fn().mockResolvedValue('cached');
+
+    client.setQueryData(['target'], 'target');
+    client.setQueryData(['unrelated'], 'unrelated');
+    await sharedFetchCache.getOrFetch(['target'], fetcher, { staleTime: 1_000 });
+
+    emitMalformedCacheEvent('cache/invalidate', {
+      queryKey: [],
+      exact: false,
+    });
+
+    expect(client.getQueryState(['target'])?.isInvalidated).toBeFalsy();
+    expect(client.getQueryState(['unrelated'])?.isInvalidated).toBeFalsy();
+
+    await sharedFetchCache.getOrFetch(['target'], fetcher, { staleTime: 1_000 });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('invalidates the same key in two separate plugin runtimes', () => {
+    const pluginA = queryCache({ gcTime: 300_000 });
+    const pluginB = queryCache({ gcTime: 300_000 });
+    pluginA.onInit!(stubApp());
+    pluginB.onInit!(stubApp());
+    const clientA = requireSharedQueryClient();
+    const clientB = requireSharedQueryClient();
+
+    clientA.setQueryData(['shared'], 'a');
+    clientB.setQueryData(['shared'], 'b');
+
+    eventBus.emit('cache/invalidate', { queryKey: ['shared'] });
+
+    expect(clientA.getQueryState(['shared'])?.isInvalidated).toBe(true);
+    expect(clientB.getQueryState(['shared'])?.isInvalidated).toBe(true);
+  });
+});
+
+// ============================================================================
+// cache/set and cache/remove events — sync sibling runtimes
+// ============================================================================
+
+describe('queryCache() — cache/set and cache/remove synchronize runtimes', () => {
+  it('cache/set updates the shared QueryClient once and invalidates shared fetch cache', async () => {
+    const pluginA = queryCache({ gcTime: 300_000 });
+    const pluginB = queryCache({ gcTime: 300_000 });
+    pluginA.onInit!(stubApp());
+    pluginB.onInit!(stubApp());
+    const clientA = requireSharedQueryClient();
+    const clientB = requireSharedQueryClient();
+    const sharedFetchCache = getSharedFetchCache();
+    const fetcher = vi.fn().mockResolvedValueOnce('first').mockResolvedValueOnce('second');
+
+    clientA.setQueryData(['entity', 'shared'], { value: 'seed' });
+    await sharedFetchCache.getOrFetch(['entity', 'shared'], fetcher, { staleTime: 1_000 });
+
+    eventBus.emit('cache/set', {
+      queryKey: ['entity', 'shared'],
+      dataOrUpdater: { value: 'optimistic' },
+    });
+
+    expect(clientA.getQueryData(['entity', 'shared'])).toEqual({ value: 'optimistic' });
+    expect(clientB.getQueryData(['entity', 'shared'])).toEqual({ value: 'optimistic' });
+
+    await sharedFetchCache.getOrFetch(['entity', 'shared'], fetcher, { staleTime: 1_000 });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it('ignores malformed cache/set events without a queryKey', async () => {
+    const pluginA = queryCache({ gcTime: 300_000 });
+    const pluginB = queryCache({ gcTime: 300_000 });
+    pluginA.onInit!(stubApp());
+    pluginB.onInit!(stubApp());
+    const clientA = requireSharedQueryClient();
+    const clientB = requireSharedQueryClient();
+    const sharedFetchCache = getSharedFetchCache();
+    const fetcher = vi.fn().mockResolvedValue('cached');
+
+    clientA.setQueryData(['entity', 'shared'], { value: 'seed' });
+    await sharedFetchCache.getOrFetch(['entity', 'shared'], fetcher, { staleTime: 1_000 });
+
+    emitMalformedCacheEvent('cache/set', {
+      dataOrUpdater: { value: 'optimistic' },
+    });
+
+    expect(clientA.getQueryData(['entity', 'shared'])).toEqual({ value: 'seed' });
+    expect(clientB.getQueryData(['entity', 'shared'])).toEqual({ value: 'seed' });
+
+    await sharedFetchCache.getOrFetch(['entity', 'shared'], fetcher, { staleTime: 1_000 });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores malformed cache/set events without dataOrUpdater', () => {
+    const pluginA = queryCache({ gcTime: 300_000 });
+    const pluginB = queryCache({ gcTime: 300_000 });
+    pluginA.onInit!(stubApp());
+    pluginB.onInit!(stubApp());
+    const clientA = requireSharedQueryClient();
+    const clientB = requireSharedQueryClient();
+
+    clientA.setQueryData(['entity', 'shared'], { value: 'seed' });
+
+    emitMalformedCacheEvent('cache/set', {
+      queryKey: ['entity', 'shared'],
+    });
+
+    expect(clientA.getQueryData(['entity', 'shared'])).toEqual({ value: 'seed' });
+    expect(clientB.getQueryData(['entity', 'shared'])).toEqual({ value: 'seed' });
+  });
+
+  it('ignores broad cache/set events with an empty queryKey', async () => {
+    const pluginA = queryCache({ gcTime: 300_000 });
+    const pluginB = queryCache({ gcTime: 300_000 });
+    pluginA.onInit!(stubApp());
+    pluginB.onInit!(stubApp());
+    const clientA = requireSharedQueryClient();
+    const clientB = requireSharedQueryClient();
+    const sharedFetchCache = getSharedFetchCache();
+    const fetcher = vi.fn().mockResolvedValue('cached');
+
+    clientA.setQueryData(['entity', 'shared'], { value: 'seed' });
+    clientA.setQueryData(['entity', 'other'], { value: 'other-seed' });
+    await sharedFetchCache.getOrFetch(['entity', 'shared'], fetcher, { staleTime: 1_000 });
+
+    emitMalformedCacheEvent('cache/set', {
+      queryKey: [],
+      dataOrUpdater: { value: 'optimistic' },
+    });
+
+    expect(clientA.getQueryData(['entity', 'shared'])).toEqual({ value: 'seed' });
+    expect(clientB.getQueryData(['entity', 'shared'])).toEqual({ value: 'seed' });
+    expect(clientA.getQueryData(['entity', 'other'])).toEqual({ value: 'other-seed' });
+    expect(clientB.getQueryData(['entity', 'other'])).toEqual({ value: 'other-seed' });
+
+    await sharedFetchCache.getOrFetch(['entity', 'shared'], fetcher, { staleTime: 1_000 });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('cache/remove evicts the shared QueryClient and invalidates shared fetch cache', async () => {
+    const pluginA = queryCache({ gcTime: 300_000 });
+    const pluginB = queryCache({ gcTime: 300_000 });
+    pluginA.onInit!(stubApp());
+    pluginB.onInit!(stubApp());
+    const clientA = requireSharedQueryClient();
+    const clientB = requireSharedQueryClient();
+    const sharedFetchCache = getSharedFetchCache();
+    const fetcher = vi.fn().mockResolvedValueOnce('first').mockResolvedValueOnce('second');
+
+    clientA.setQueryData(['entity', 'remove'], { value: 'seed' });
+    await sharedFetchCache.getOrFetch(['entity', 'remove'], fetcher, { staleTime: 1_000 });
+
+    eventBus.emit('cache/remove', {
+      queryKey: ['entity', 'remove'],
+    });
+
+    expect(clientA.getQueryData(['entity', 'remove'])).toBeUndefined();
+    expect(clientB.getQueryData(['entity', 'remove'])).toBeUndefined();
+
+    await sharedFetchCache.getOrFetch(['entity', 'remove'], fetcher, { staleTime: 1_000 });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it('ignores malformed cache/remove events without a queryKey', async () => {
+    const pluginA = queryCache({ gcTime: 300_000 });
+    const pluginB = queryCache({ gcTime: 300_000 });
+    pluginA.onInit!(stubApp());
+    pluginB.onInit!(stubApp());
+    const clientA = requireSharedQueryClient();
+    const clientB = requireSharedQueryClient();
+    const sharedFetchCache = getSharedFetchCache();
+    const fetcher = vi.fn().mockResolvedValue('cached');
+
+    clientA.setQueryData(['entity', 'remove'], { value: 'seed' });
+    await sharedFetchCache.getOrFetch(['entity', 'remove'], fetcher, { staleTime: 1_000 });
+
+    emitMalformedCacheEvent('cache/remove', {});
+
+    expect(clientA.getQueryData(['entity', 'remove'])).toEqual({ value: 'seed' });
+    expect(clientB.getQueryData(['entity', 'remove'])).toEqual({ value: 'seed' });
+
+    await sharedFetchCache.getOrFetch(['entity', 'remove'], fetcher, { staleTime: 1_000 });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores broad cache/remove events with an empty queryKey', async () => {
+    const pluginA = queryCache({ gcTime: 300_000 });
+    const pluginB = queryCache({ gcTime: 300_000 });
+    pluginA.onInit!(stubApp());
+    pluginB.onInit!(stubApp());
+    const clientA = requireSharedQueryClient();
+    const clientB = requireSharedQueryClient();
+    const sharedFetchCache = getSharedFetchCache();
+    const fetcher = vi.fn().mockResolvedValue('cached');
+
+    clientA.setQueryData(['entity', 'remove'], { value: 'seed' });
+    clientA.setQueryData(['entity', 'keep'], { value: 'keep-seed' });
+    await sharedFetchCache.getOrFetch(['entity', 'remove'], fetcher, { staleTime: 1_000 });
+
+    emitMalformedCacheEvent('cache/remove', {
+      queryKey: [],
+    });
+
+    expect(clientA.getQueryData(['entity', 'remove'])).toEqual({ value: 'seed' });
+    expect(clientB.getQueryData(['entity', 'remove'])).toEqual({ value: 'seed' });
+    expect(clientA.getQueryData(['entity', 'keep'])).toEqual({ value: 'keep-seed' });
+    expect(clientB.getQueryData(['entity', 'keep'])).toEqual({ value: 'keep-seed' });
+
+    await sharedFetchCache.getOrFetch(['entity', 'remove'], fetcher, { staleTime: 1_000 });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ============================================================================
+// onDestroy — cleanup
+// ============================================================================
+
+describe('queryCache() — onDestroy cleanup', () => {
+  it('onDestroy releases the shared retainer and stops responding to MockEvents.Toggle', async () => {
+    const plugin = queryCache();
+    plugin.onInit!(stubApp());
+    const client = requireSharedQueryClient();
+
+    client.setQueryData(['stale'], 'value');
+    plugin.onDestroy!(stubApp());
+
+    await flushQueryCacheClear();
+
+    expect(peekSharedQueryClientRetainers()).toBe(0);
+    expect(peekSharedQueryClient()).toBeUndefined();
+
+    // The listener must be gone: seeding the (now-detached) client and
+    // emitting MockEvents.Toggle should not purge the reference we still
+    // hold — if the listener were still live and the shared client still
+    // alive it would have been cleared.
+    client.setQueryData(['after-destroy'], 'value');
+    eventBus.emit(MockEvents.Toggle, { enabled: true });
+    // Allow any lingering microtasks a chance to run.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(client.getQueryData(['after-destroy'])).toBe('value');
+  });
+
+  it('clears cached data on destroy', async () => {
+    const plugin = queryCache({ gcTime: 300_000 });
+    plugin.onInit!(stubApp());
+    const client = requireSharedQueryClient();
+
+    client.setQueryData(['key'], 'value');
+
+    plugin.onDestroy!(stubApp());
+    await flushQueryCacheClear();
+
+    expect(client.getQueryData(['key'])).toBeUndefined();
+  });
+
+  it('resets the shared fetch cache after the last plugin runtime is destroyed', async () => {
+    const plugin = queryCache();
+    const firstCache = getSharedFetchCache();
+    const fetcher = vi.fn().mockResolvedValueOnce('first').mockResolvedValueOnce('second');
+
+    plugin.onInit!(stubApp());
+    await firstCache.getOrFetch(['shared'], fetcher, { staleTime: 1_000 });
+
+    plugin.onDestroy!(stubApp());
+    await flushQueryCacheClear();
+
+    const secondCache = getSharedFetchCache();
+    await secondCache.getOrFetch(['shared'], fetcher, { staleTime: 1_000 });
+
+    expect(secondCache).not.toBe(firstCache);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it('clears retained shared fetch cache entries on destroy', async () => {
+    const plugin = queryCache();
+    const sharedFetchCache = getSharedFetchCache();
+    const fetcher = vi.fn().mockResolvedValueOnce('first').mockResolvedValueOnce('second');
+
+    plugin.onInit!(stubApp());
+    await sharedFetchCache.getOrFetch(['shared'], fetcher, { staleTime: 1_000 });
+    await sharedFetchCache.getOrFetch(['shared'], fetcher, { staleTime: 1_000 });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+
+    plugin.onDestroy!(stubApp());
+    await flushQueryCacheClear();
+
+    await sharedFetchCache.getOrFetch(['shared'], fetcher, { staleTime: 1_000 });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it('after onDestroy, MockEvents.Toggle no longer clears cache (unsubscribed)', () => {
+    const plugin = queryCache({ gcTime: 300_000 });
+    plugin.onInit!(stubApp());
+    const client = requireSharedQueryClient();
+
+    plugin.onDestroy!(stubApp());
+
+    client.setQueryData(['key'], 'fresh');
+
+    eventBus.emit(MockEvents.Toggle, { enabled: true });
+
+    expect(client.getQueryData(['key'])).toBe('fresh');
+  });
+
+  it('after onDestroy, cache/invalidate no longer invalidates queries (unsubscribed)', () => {
+    const plugin = queryCache({ gcTime: 300_000 });
+    plugin.onInit!(stubApp());
+    const client = requireSharedQueryClient();
+
+    plugin.onDestroy!(stubApp());
+
+    client.setQueryData(['key'], 'fresh');
+
+    eventBus.emit('cache/invalidate', { queryKey: ['key'] });
+
+    const state = client.getQueryState(['key']);
+    expect(state?.isInvalidated).toBeFalsy();
+  });
+
+  it('calling onDestroy multiple times does not change retainer count below zero', async () => {
+    const plugin = queryCache();
+    plugin.onInit!(stubApp());
+    plugin.onDestroy!(stubApp());
+    await flushQueryCacheClear();
+
+    expect(peekSharedQueryClientRetainers()).toBe(0);
+    expect(() => {
+      plugin.onDestroy!(stubApp());
+    }).not.toThrow();
+    await flushQueryCacheClear();
+
+    expect(peekSharedQueryClientRetainers()).toBe(0);
+    expect(peekSharedQueryClient()).toBeUndefined();
+  });
+
+  it('two plugin instances have independent cleanup — destroying one does not break the other', async () => {
+    const pluginA = queryCache();
+    const pluginB = queryCache();
+    pluginA.onInit!(stubApp());
+    pluginB.onInit!(stubApp());
+    const clientA = requireSharedQueryClient();
+    const clientB = requireSharedQueryClient();
+
+    clientA.setQueryData(['a'], 'dataA');
+    clientB.setQueryData(['b'], 'dataB');
+
+    pluginA.onDestroy!(stubApp());
+    await flushQueryCacheClear();
+
+    clientB.setQueryData(['b'], 'dataB-fresh');
+    eventBus.emit('cache/invalidate', { queryKey: ['b'] });
+
+    expect(clientB.getQueryState(['b'])?.isInvalidated).toBe(true);
+    expect(clientA.getQueryData(['a'])).toBe('dataA');
+
+    eventBus.emit(MockEvents.Toggle, { enabled: true });
+    await waitForQueryDataGone(clientB, ['b']);
+
+    pluginB.onDestroy!(stubApp());
+  });
+
+  it('does not reset the shared fetch cache while another plugin runtime is still active', async () => {
+    const pluginA = queryCache();
+    const pluginB = queryCache();
+    const fetcher = vi.fn().mockResolvedValue('shared');
+
+    pluginA.onInit!(stubApp());
+    pluginB.onInit!(stubApp());
+
+    const firstCache = getSharedFetchCache();
+    await firstCache.getOrFetch(['shared'], fetcher, { staleTime: 1_000 });
+
+    pluginA.onDestroy!(stubApp());
+    await flushQueryCacheClear();
+
+    const secondCache = getSharedFetchCache();
+    await secondCache.getOrFetch(['shared'], fetcher, { staleTime: 1_000 });
+
+    expect(secondCache).toBe(firstCache);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+
+    pluginB.onDestroy!(stubApp());
+  });
+
+  it('waits for cancellation before clearing runtime and releasing shared fetch cache', async () => {
+    const plugin = queryCache();
+    plugin.onInit!(stubApp());
+    const client = requireSharedQueryClient();
+    const deferred = createDeferred();
+    const firstCache = getSharedFetchCache();
+    const clearSpy = vi.spyOn(client, 'clear');
+
+    const cancelQueriesSpy = vi
+      .spyOn(client, 'cancelQueries')
+      .mockImplementation(() => deferred.promise);
+
+    plugin.onDestroy!(stubApp());
+    await flushQueryCacheClear();
+
+    expect(cancelQueriesSpy).toHaveBeenCalledTimes(1);
+    expect(clearSpy).not.toHaveBeenCalled();
+    expect(getSharedFetchCache()).toBe(firstCache);
+
+    deferred.resolve();
+    await flushQueryCacheClear();
+
+    expect(clearSpy).toHaveBeenCalledTimes(1);
+    expect(getSharedFetchCache()).not.toBe(firstCache);
+  });
+
+  it('reuses the same shared QueryClient if a new host plugin starts before destroy teardown settles', async () => {
+    const firstPlugin = queryCache();
+    firstPlugin.onInit!(stubApp());
+    const firstClient = requireSharedQueryClient();
+    const deferred = createDeferred();
+    const clearSpy = vi.spyOn(firstClient, 'clear');
+
+    vi.spyOn(firstClient, 'cancelQueries').mockImplementation(() => deferred.promise);
+
+    firstPlugin.onDestroy!(stubApp());
+    await flushQueryCacheClear();
+
+    expect(peekSharedQueryClient()).toBe(firstClient);
+    expect(peekSharedQueryClientRetainers()).toBe(0);
+
+    const secondPlugin = queryCache();
+    secondPlugin.onInit!(stubApp());
+    const secondClient = requireSharedQueryClient();
+
+    expect(secondClient).toBe(firstClient);
+    expect(peekSharedQueryClient()).toBe(firstClient);
+    expect(peekSharedQueryClientRetainers()).toBe(1);
+
+    deferred.resolve();
+    await flushQueryCacheClear();
+
+    expect(clearSpy).not.toHaveBeenCalled();
+    expect(peekSharedQueryClient()).toBe(firstClient);
+    expect(peekSharedQueryClientRetainers()).toBe(1);
+
+    secondPlugin.onDestroy!(stubApp());
+    await flushQueryCacheClear();
+  });
+
+  it('releases the original shared fetch cache retain when host teardown is superseded', async () => {
+    const firstPlugin = queryCache();
+    firstPlugin.onInit!(stubApp());
+    const firstClient = requireSharedQueryClient();
+    const firstCache = getSharedFetchCache();
+    const deferred = createDeferred();
+    const fetcher = vi.fn().mockResolvedValue('shared');
+
+    vi.spyOn(firstClient, 'cancelQueries')
+      .mockImplementationOnce(() => deferred.promise)
+      .mockResolvedValue(undefined);
+
+    await firstCache.getOrFetch(['shared'], fetcher, { staleTime: 1_000 });
+
+    firstPlugin.onDestroy!(stubApp());
+    await flushQueryCacheClear();
+
+    const secondPlugin = queryCache();
+    secondPlugin.onInit!(stubApp());
+
+    deferred.resolve();
+    await flushQueryCacheClear();
+
+    secondPlugin.onDestroy!(stubApp());
+    await flushQueryCacheClear();
+
+    const secondCache = getSharedFetchCache();
+    await secondCache.getOrFetch(['shared'], fetcher, { staleTime: 1_000 });
+
+    expect(secondCache).not.toBe(firstCache);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it('lets queryCacheShared() join the pending shared runtime before destroy teardown settles', async () => {
+    const hostPlugin = queryCache();
+    const sharedPlugin = queryCacheShared();
+    hostPlugin.onInit!(stubApp());
+    const hostClient = requireSharedQueryClient();
+    const deferred = createDeferred();
+    const clearSpy = vi.spyOn(hostClient, 'clear');
+
+    vi.spyOn(hostClient, 'cancelQueries').mockImplementation(() => deferred.promise);
+
+    hostPlugin.onDestroy!(stubApp());
+    await flushQueryCacheClear();
+
+    sharedPlugin.onInit!(stubApp());
+
+    expect(peekSharedQueryClient()).toBe(hostClient);
+    expect(peekSharedQueryClientRetainers()).toBe(1);
+
+    deferred.resolve();
+    await flushQueryCacheClear();
+
+    expect(clearSpy).not.toHaveBeenCalled();
+    expect(peekSharedQueryClient()).toBe(hostClient);
+    expect(peekSharedQueryClientRetainers()).toBe(1);
+
+    sharedPlugin.onDestroy!(stubApp());
+    await flushQueryCacheClear();
+  });
+
+  it('releases the original shared fetch cache retain when shared teardown is superseded', async () => {
+    const hostPlugin = queryCache();
+    const firstSharedPlugin = queryCacheShared();
+    hostPlugin.onInit!(stubApp());
+    firstSharedPlugin.onInit!(stubApp());
+    const hostClient = requireSharedQueryClient();
+    const firstCache = getSharedFetchCache();
+    const deferred = createDeferred();
+    const fetcher = vi.fn().mockResolvedValue('shared');
+
+    vi.spyOn(hostClient, 'cancelQueries')
+      .mockImplementationOnce(() => deferred.promise)
+      .mockResolvedValue(undefined);
+
+    await firstCache.getOrFetch(['shared'], fetcher, { staleTime: 1_000 });
+
+    hostPlugin.onDestroy!(stubApp());
+    await flushQueryCacheClear();
+
+    firstSharedPlugin.onDestroy!(stubApp());
+    await flushQueryCacheClear();
+
+    const secondSharedPlugin = queryCacheShared();
+    secondSharedPlugin.onInit!(stubApp());
+
+    deferred.resolve();
+    await flushQueryCacheClear();
+
+    secondSharedPlugin.onDestroy!(stubApp());
+    await flushQueryCacheClear();
+
+    const secondCache = getSharedFetchCache();
+    await secondCache.getOrFetch(['shared'], fetcher, { staleTime: 1_000 });
+
+    expect(secondCache).not.toBe(firstCache);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it('still releases the shared fetch cache when runtime cancellation fails on destroy', async () => {
+    await withSilencedConsoleError(async (consoleErrorSpy) => {
+      const plugin = queryCache();
+      plugin.onInit!(stubApp());
+      const client = requireSharedQueryClient();
+      const firstCache = getSharedFetchCache();
+      const fetcher = vi.fn().mockResolvedValue('shared');
+      const clearSpy = vi.spyOn(client, 'clear');
+
+      const cancelQueriesSpy = vi
+        .spyOn(client, 'cancelQueries')
+        .mockRejectedValue(new Error('cancel failed'));
+      client.setQueryData(['stale'], 'value');
+      await firstCache.getOrFetch(['shared'], fetcher, { staleTime: 1_000 });
+
+      plugin.onDestroy!(stubApp());
+      await flushQueryCacheClear();
+
+      expect(cancelQueriesSpy).toHaveBeenCalledTimes(1);
+      expect(clearSpy).toHaveBeenCalledTimes(1);
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        '[Gears FrontX] Failed to destroy query cache runtime',
+        expect.any(Error)
+      );
+      expect(client.getQueryData(['stale'])).toBeUndefined();
+
+      const secondCache = getSharedFetchCache();
+      await secondCache.getOrFetch(['shared'], fetcher, { staleTime: 1_000 });
+
+      expect(secondCache).not.toBe(firstCache);
+      expect(fetcher).toHaveBeenCalledTimes(2);
+    });
+  });
+});

@@ -1,0 +1,37 @@
+/**
+ * Footer Component
+ *
+ * Application footer with theme/screenset controls.
+ * Seeded with the template; the project owns this file and edits it directly.
+ */
+
+import React from 'react';
+import { useAppSelector, type FooterState } from '@gears-frontx/react';
+import styles from './Footer.module.css';
+
+export interface FooterProps {
+  children?: React.ReactNode;
+}
+
+export const Footer: React.FC<FooterProps> = ({ children }) => {
+  const footerState = useAppSelector((state) => state['layout/footer'] as FooterState | undefined);
+  const visible = footerState?.visible ?? true;
+
+  // `visible` is the only switch here, driven by `app.actions.setFooterVisible`
+  // from the layout plugin. Whether there is anything worth framing is the
+  // caller's question, not this component's: the strip carries nothing of its
+  // own, so a `Footer` with no children is a 40px band of border and background
+  // no screen can fill, and `Layout` therefore renders none until it has
+  // content to put in one.
+  if (!visible) {
+    return null;
+  }
+
+  return (
+    <footer className={styles.footer}>
+      {children}
+    </footer>
+  );
+};
+
+Footer.displayName = 'Footer';

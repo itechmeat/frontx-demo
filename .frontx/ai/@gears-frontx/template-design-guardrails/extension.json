@@ -1,0 +1,16 @@
+{
+  "id": "template-design-guardrails-ai-bundle",
+  "contractVersion": "1.0.0",
+  "entries": [
+    {
+      "id": "frontx-design",
+      "category": "skills",
+      "path": "skills/frontx-design"
+    },
+    {
+      "id": "frontx-design-proposal",
+      "category": "skills",
+      "path": "skills/frontx-design-proposal"
+    }
+  ]
+}

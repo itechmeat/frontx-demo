@@ -1,0 +1,48 @@
+/**
+ * FrontX Application Component
+ *
+ * Renders the Layout with MFE screen container.
+ * Seeded with the template; the project owns this file and edits it directly.
+ *
+ * FrontXProvider (in main.tsx) handles:
+ * - Redux Provider setup
+ * - FrontX context (app instance)
+ *
+ * Layout handles:
+ * - Header, Menu, Sidebar rendering
+ * - Theme-aware styling via hooks
+ *
+ * MfeScreenContainer handles:
+ * - MFE domain registration
+ * - MFE extension loading and mounting
+ * - DOM container for MFE content
+ *
+ * StudioOverlay (development builds only; a production build carries none of
+ * it):
+ * - Development tools for theme/screenset switching
+ * - Language selection
+ * - API mode toggle (services register their own mocks)
+ *
+ * The entry loads it with loadStudioOverlay() before the first render and
+ * passes it in as a prop, so its restore of mock mode, theme and language
+ * runs in the same commit as the app instead of after a lazy chunk.
+ */
+
+import type { ComponentType } from 'react';
+import { Layout } from '@/app/layout';
+import { MfeScreenContainer } from '@/app/mfe/MfeScreenContainer';
+import { ScreenLoadFailed } from '@/app/mfe/ScreenLoadFailed';
+
+// The demo renders no development tools panel over its pages, so the Studio
+// overlay the entry loads is accepted and not shown.
+function App(_props: { StudioOverlay?: ComponentType | null }) {
+  return (
+    <>
+      <Layout>
+        <MfeScreenContainer LoadFailed={ScreenLoadFailed} />
+      </Layout>
+    </>
+  );
+}
+
+export default App;

@@ -1,0 +1,26 @@
+{
+  "id": "frontx-template-shell-ai-bundle",
+  "contractVersion": "1.0.0",
+  "entries": [
+    {
+      "id": "mfe-package-contract",
+      "category": "guidelines",
+      "path": "guidelines/mfe-package-contract.md"
+    },
+    {
+      "id": "navigation-composition",
+      "category": "guidelines",
+      "path": "guidelines/navigation-composition.md"
+    },
+    {
+      "id": "sign-in",
+      "category": "guidelines",
+      "path": "guidelines/sign-in.md"
+    },
+    {
+      "id": "verification-walk-axes",
+      "category": "guidelines",
+      "path": "guidelines/verification-walk-axes.md"
+    }
+  ]
+}

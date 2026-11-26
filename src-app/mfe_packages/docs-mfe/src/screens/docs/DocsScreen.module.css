@@ -1,0 +1,452 @@
+/*
+ * The Docs page. Phone first: the base rules are the 390 px layout; wider
+ * layouts come in with min-width queries (768 px tablet, 1200 px desktop).
+ * The content column runs from the window edge minus 20 px on a phone to
+ * 68 px from 1200 px up, the same line as on every other page.
+ */
+:host {
+  --frontx-screen-inline-padding: 0;
+}
+
+.screen {
+  min-height: 100%;
+}
+
+.page {
+  --background: var(--app-page);
+  --foreground: var(--app-navy);
+  --card: var(--app-page);
+  --card-hover: var(--app-page);
+  --card-foreground: var(--app-navy);
+  --muted-foreground: var(--app-muted);
+  --border: var(--app-line);
+  --input: var(--app-line);
+  --primary: var(--app-accent);
+  --primary-hover: var(--app-accent-hover);
+  --primary-ring: var(--app-accent-hover);
+  --ring: var(--app-accent);
+  --accent: var(--app-accent);
+  --code-background: var(--app-tint);
+
+  --gutter: var(--app-gutter-phone);
+  --item-gap: var(--space-4);
+
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+  padding: var(--space-14) var(--gutter) var(--space-14);
+  background-color: var(--app-page);
+  color: var(--app-navy);
+}
+
+.nowrap {
+  white-space: nowrap;
+}
+
+.arrow {
+  display: inline-block;
+  width: var(--icon-size-sm);
+  height: var(--icon-size-sm);
+  margin-left: var(--space-1);
+  vertical-align: -0.125em;
+}
+
+/* ---------- Type ---------- */
+
+.pageTitle {
+  margin: 0;
+  color: var(--app-navy);
+  font-size: var(--text-page-phone-size);
+  font-weight: 600;
+  line-height: var(--text-page-phone-line-height);
+  letter-spacing: var(--app-tracking-tight);
+}
+
+.groupTitle {
+  margin: 0;
+  color: var(--app-navy);
+  font-size: var(--text-group-size);
+  font-weight: 700;
+  line-height: var(--text-group-line-height);
+}
+
+.cardTitleSm {
+  margin: 0;
+  color: var(--app-navy);
+  font-size: var(--text-card-title-sm-size);
+  font-weight: 700;
+  line-height: var(--text-card-title-sm-line-height);
+}
+
+.itemTitle {
+  margin: 0;
+  color: var(--app-navy);
+  font-size: var(--text-item-size);
+  font-weight: 600;
+  line-height: var(--text-item-line-height);
+}
+
+.lead,
+.headLead {
+  margin: 0;
+  color: var(--app-muted);
+  font-size: var(--text-lead-size);
+  line-height: var(--text-lead-line-height);
+}
+
+.headLead {
+  max-width: var(--app-lead-measure);
+}
+
+.body {
+  margin: 0;
+  color: var(--app-muted);
+  font-size: var(--text-copy-size);
+  line-height: var(--text-copy-line-height);
+}
+
+.note {
+  margin: 0;
+  color: var(--app-muted);
+  font-size: var(--text-label-size);
+  line-height: var(--text-label-line-height);
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-size: var(--text-label-size);
+}
+
+.accentLink {
+  color: var(--app-accent);
+  font-size: var(--text-copy-size);
+  font-weight: 600;
+  line-height: var(--text-copy-line-height);
+  text-decoration: none;
+}
+
+.accentLink:hover {
+  color: var(--app-accent-hover);
+  text-decoration: none;
+}
+
+/* ---------- Page head and tabs ---------- */
+
+.head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.tabs {
+  display: flex;
+  flex-direction: column;
+  margin-top: var(--space-10);
+  min-width: 0;
+}
+
+/* One thin line under the whole row; the row scrolls sideways inside itself. */
+.tabRow {
+  overflow-x: auto;
+  border-bottom: 1px solid var(--app-line);
+  scrollbar-width: none;
+  scroll-margin-top: var(--space-6);
+}
+
+.tabRow::-webkit-scrollbar {
+  display: none;
+}
+
+.tabs .tabList {
+  --indicator-gap: 0;
+  --indicator-thickness: calc(var(--space-1) / 2);
+  gap: var(--space-6);
+  height: var(--space-11);
+  padding: 0;
+}
+
+.tabList .tab {
+  flex: 0 0 auto;
+  height: var(--space-11);
+  padding: 0;
+  border-radius: 0;
+  color: var(--app-muted);
+  font-size: var(--text-nav-size);
+  font-weight: 500;
+}
+
+.tabList .tab:hover {
+  color: var(--app-navy);
+}
+
+.tabList .tab[data-active] {
+  color: var(--app-accent);
+}
+
+.panel {
+  min-width: 0;
+  padding-top: var(--space-8);
+}
+
+/* ---------- Overview ---------- */
+
+.overview {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-8);
+}
+
+.overview .promptCard {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-6);
+  padding: var(--app-card-pad-lg);
+  border-radius: var(--radius-lg);
+}
+
+.promptIntro {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.code {
+  border-color: transparent;
+  border-radius: var(--radius-md);
+  background-color: var(--app-tint);
+}
+
+.code .codeHead {
+  justify-content: space-between;
+}
+
+.code .codeLabel {
+  color: var(--app-muted);
+  font-size: var(--text-label-size);
+  font-weight: 500;
+}
+
+.code .codeBody {
+  padding: var(--space-2) var(--space-4) var(--space-4);
+  color: var(--app-navy);
+  font-size: var(--text-nav-size);
+  line-height: var(--text-copy-line-height);
+}
+
+.code .copy {
+  --button-bg: var(--app-page);
+}
+
+.guideCards {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--item-gap);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.guideCardItem {
+  display: flex;
+  min-width: 0;
+}
+
+.guideCardItem .guideCard {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  width: 100%;
+  padding: var(--app-card-pad) var(--space-6);
+  border-radius: var(--radius-lg);
+  color: var(--app-navy);
+}
+
+.guidePicture {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: var(--app-picture-phone-height);
+}
+
+.guideFigure {
+  display: block;
+  width: var(--app-picture-width);
+  max-height: 100%;
+}
+
+.guideFigure svg {
+  max-height: var(--app-picture-phone-height);
+}
+
+.guideText {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.guideArrow {
+  width: var(--icon-size-md);
+  height: var(--icon-size-md);
+  margin-top: auto;
+  padding-top: var(--space-2);
+  color: var(--app-accent);
+  box-sizing: content-box;
+}
+
+.sources {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+  margin-top: var(--space-6);
+}
+
+.sourceCards {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--item-gap);
+}
+
+.sourceCards .sourceCard {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--app-card-pad-lg);
+  border-radius: var(--radius-lg);
+}
+
+.sourceCard .outlineCta {
+  height: var(--control-height-xl);
+  margin-top: var(--space-2);
+  padding: 0 var(--space-5);
+  border-radius: var(--radius-sm);
+  color: var(--app-navy);
+  font-size: var(--text-copy-size);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.linkList {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+/* ---------- Guides ---------- */
+
+.guide,
+.libraries {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-8);
+  max-width: var(--app-guide-measure);
+}
+
+.libraries {
+  max-width: none;
+}
+
+.guideHead {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.steps {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-8);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.step {
+  display: grid;
+  grid-template-columns: var(--space-8) minmax(0, 1fr);
+  gap: var(--space-4);
+}
+
+.stepNumber {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--space-8);
+  height: var(--space-8);
+  border-radius: var(--radius-full);
+  background-color: var(--app-accent);
+  color: var(--app-on-accent);
+  font-size: var(--text-nav-size);
+  font-weight: 600;
+}
+
+.stepBody {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.stepBody .code {
+  margin-top: var(--space-2);
+}
+
+.libraries .tableCard {
+  padding: 0;
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+/* ---------- Tablet ---------- */
+
+@media (min-width: 768px) {
+  .page {
+    --gutter: var(--space-10);
+    --item-gap: var(--space-6);
+  }
+
+  .pageTitle {
+    font-size: var(--text-page-size);
+    line-height: var(--text-page-line-height);
+  }
+
+  .sourceCards {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* ---------- Desktop ---------- */
+
+@media (min-width: 1200px) {
+  .page {
+    --gutter: var(--app-gutter);
+  }
+
+  .overview .promptCard {
+    grid-template-columns: var(--app-prompt-aside) minmax(0, 1fr);
+    gap: var(--space-10);
+    align-items: start;
+  }
+
+  .guideCards {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .guideCardItem .guideCard {
+    display: grid;
+    grid-template-columns: var(--app-picture-width) minmax(0, 1fr);
+    gap: var(--space-5);
+    min-height: var(--app-docs-card-height);
+  }
+
+  .guidePicture {
+    height: auto;
+  }
+
+  .guideFigure svg {
+    max-height: none;
+  }
+}

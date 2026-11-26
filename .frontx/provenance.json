@@ -1,0 +1,20 @@
+[
+  {
+    "templateIdentity": "@gears-frontx/frontx-template-shell",
+    "scaffoldedFromVersion": "0.1.0-alpha.9",
+    "sourceSpec": "github:constructorfabric/gears-frontx-templates//template-shell@main",
+    "occupiedOwnershipBoundary": "."
+  },
+  {
+    "templateIdentity": "@gears-frontx/frontx-template-mfe",
+    "scaffoldedFromVersion": "0.1.0-alpha.8",
+    "sourceSpec": "github:constructorfabric/gears-frontx-templates//template-mfe@main",
+    "occupiedOwnershipBoundary": "."
+  },
+  {
+    "templateIdentity": "@gears-frontx/template-design-guardrails",
+    "scaffoldedFromVersion": "0.1.0-alpha.9",
+    "sourceSpec": "github:constructorfabric/gears-frontx-templates//template-design-guardrails@main",
+    "occupiedOwnershipBoundary": "."
+  }
+]

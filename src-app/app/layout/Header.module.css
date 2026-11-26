@@ -1,0 +1,64 @@
+/*
+ * The top bar. Phone first: two rows (the mark and name, then the page links
+ * in one row that scrolls sideways inside itself). From 768 px up: one 72 px
+ * row, the brand 56 px from the left window edge and the links ending 56 px
+ * before the right one. The bottom line runs across the whole window.
+ */
+.header {
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  width: 100%;
+  border-bottom: 1px solid var(--app-header-line);
+  background-color: var(--background);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--space-14);
+  padding: 0 var(--app-gutter-phone);
+}
+
+.mark {
+  width: var(--space-6);
+  height: var(--space-6);
+  color: var(--app-accent);
+}
+
+.name {
+  color: var(--app-navy);
+  font-size: var(--text-brand-size);
+  font-weight: 600;
+  line-height: var(--text-heading-2-line-height);
+}
+
+.nav {
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.nav::-webkit-scrollbar {
+  display: none;
+}
+
+@media (min-width: 768px) {
+  .header {
+    flex-direction: row;
+    align-items: stretch;
+    justify-content: space-between;
+    height: var(--app-header-height);
+  }
+
+  .brand {
+    padding: 0 0 0 var(--app-header-inset);
+  }
+
+  .nav {
+    display: flex;
+    padding-right: var(--app-header-inset);
+    overflow-x: visible;
+  }
+}

@@ -1,0 +1,5 @@
+{"waivers": [
+  {"gate": "LAY-005",
+   "screen": {"route": "/?screen=home", "source": "src-app/mfe_packages/home-mfe/**"},
+   "reason": "The 'Screens of this app' card is split into a head row and three columns that each carry their own padding, so the divider lines between them run the full width of the card (page rule 4); the card itself therefore has no side padding of its own."}
+]}

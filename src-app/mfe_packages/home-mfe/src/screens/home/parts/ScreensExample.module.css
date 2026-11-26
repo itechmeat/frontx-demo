@@ -1,0 +1,178 @@
+/*
+ * "Screens of this app": one wide card, a 52 px head row closed by a line
+ * across the card, then three columns divided by thin lines. Phone first:
+ * the columns stack, divided by horizontal lines; from 1024 px they sit in
+ * a row, divided by vertical lines.
+ */
+.card {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--app-line);
+  border-radius: var(--radius-lg);
+  background-color: var(--app-page);
+  min-width: 0;
+}
+
+.head {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: var(--space-1);
+  min-height: var(--space-13);
+  padding: var(--space-3) var(--space-5);
+  border-bottom: 1px solid var(--app-line);
+}
+
+.title {
+  margin: 0;
+  color: var(--app-navy);
+  font-size: var(--text-card-title-sm-size);
+  font-weight: 700;
+  line-height: var(--text-card-title-sm-line-height);
+}
+
+.note {
+  margin: 0;
+  color: var(--app-muted);
+  font-size: var(--text-label-size);
+  line-height: var(--text-label-line-height);
+}
+
+.columns {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.column {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+  padding: var(--space-5);
+}
+
+.column + .column {
+  border-top: 1px solid var(--app-line);
+}
+
+.columnTitle {
+  margin: 0;
+  color: var(--app-navy);
+  font-size: var(--text-item-size);
+  font-weight: 600;
+  line-height: var(--text-item-line-height);
+}
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.switchRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  color: var(--app-navy);
+}
+
+.column .submit {
+  align-self: flex-start;
+}
+
+.panel {
+  min-width: 0;
+  padding-top: var(--space-3);
+}
+
+.nameCell {
+  color: var(--app-navy);
+  font-weight: 600;
+}
+
+.actionCell {
+  text-align: right;
+}
+
+.empty {
+  max-width: none;
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-3);
+  margin: 0;
+}
+
+.stat {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-3);
+  border: 1px solid var(--app-line);
+  border-radius: var(--radius-lg);
+}
+
+.statLabel {
+  color: var(--app-muted);
+  font-size: var(--text-label-size);
+  line-height: var(--text-label-line-height);
+}
+
+.statValue {
+  margin: 0;
+  color: var(--app-navy);
+}
+
+.chart {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+}
+
+.chartTitle {
+  color: var(--app-navy);
+  font-size: var(--text-label-size);
+  font-weight: 600;
+  line-height: var(--text-label-line-height);
+}
+
+.chartBox {
+  --chart-aspect-ratio: 4 / 3;
+  width: 100%;
+}
+
+@media (min-width: 1024px) {
+  .head {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 var(--space-6);
+  }
+
+  .columns {
+    grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.35fr) minmax(0, 1fr);
+  }
+
+  .column {
+    padding: var(--space-6);
+  }
+
+  .column + .column {
+    border-top: 0;
+    border-left: 1px solid var(--app-line);
+  }
+}
+
+/* The select fills its field, like the text field above it. */
+.form .select {
+  width: 100%;
+}
+
+/* A ghost row action that still reads as an action at rest: accent label. */
+.actionCell .rowAction {
+  --button-fg: var(--app-accent);
+  --button-fg-hover: var(--app-accent-hover);
+}

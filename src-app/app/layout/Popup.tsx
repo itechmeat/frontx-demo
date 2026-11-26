@@ -1,0 +1,45 @@
+/**
+ * Popup Component
+ *
+ * Modal dialog container.
+ * Seeded with the template; the project owns this file and edits it directly.
+ */
+
+import React from 'react';
+import { useAppSelector, type PopupSliceState } from '@gears-frontx/react';
+import styles from './Popup.module.css';
+
+export interface PopupProps {
+  children?: React.ReactNode;
+}
+
+export const Popup: React.FC<PopupProps> = ({ children }) => {
+  const popupState = useAppSelector((state) => state['layout/popup'] as PopupSliceState | undefined);
+  const stack = popupState?.stack ?? [];
+
+  if (stack.length === 0) {
+    return null;
+  }
+
+  // Render the top popup from the stack
+  const topPopup = stack[stack.length - 1];
+
+  return (
+    <div className={styles.popup}>
+      {/* Backdrop */}
+      <div className={styles.backdrop} />
+
+      {/* Dialog - z-index is calculated as 1000 + stack depth * 10 */}
+      <div className={styles.dialog}>
+        {topPopup.title && (
+          <div className={styles.header}>
+            <h2 className={styles.title}>{topPopup.title}</h2>
+          </div>
+        )}
+        {children}
+      </div>
+    </div>
+  );
+};
+
+Popup.displayName = 'Popup';
