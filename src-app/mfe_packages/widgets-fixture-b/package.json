@@ -5,10 +5,10 @@
   "type": "module",
   "description": "Leaf widget MFE. Targets the widgets domain (owned by demo-mfe's child FrontX app at runtime) via its Extension instance. Mounts concurrently alongside widgets-fixture-a under ConcurrentMountStrategy.",
   "scripts": {
-    "dev": "vite build && vite preview --port 3202",
+    "dev": "vite build && vite preview --port 5887",
     "build": "vite build",
     "type-check": "tsc --noEmit",
-    "preview": "vite preview --port 3202"
+    "preview": "vite preview --port 5887"
   },
   "dependencies": {
     "react": "19.2.4",

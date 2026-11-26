@@ -2,7 +2,7 @@
   "templateExample": true,
   "manifest": {
     "id": "gts.frontx.mfes.mfe.mf_manifest.v1~frontx.widgets.fixture_b.manifest.v1",
-    "remoteEntry": "http://localhost:3202/assets/remoteEntry.js"
+    "remoteEntry": "http://localhost:5887/assets/remoteEntry.js"
   },
   "entries": [
     {

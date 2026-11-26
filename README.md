@@ -1,3 +1,48 @@
+# FrontX demo: two AI agents, one Tasks page
+
+A FrontX demo app built by AI agents from short prompts. First the Home and Docs pages were built; then the same "Tasks" page was built twice, from the same starting state and the same prompt: once by Claude Opus and once by GLM. This app shows both results side by side.
+
+The git history follows those steps: `Home and Docs pages`, `Tasks page built by Claude Opus`, `Tasks page built by GLM, both pages side by side`.
+
+## Requirements
+
+- Node.js 24.14.0 or newer
+- npm 10 or newer
+
+## Install and start
+
+```bash
+npm install
+npm run build:packages
+npm run dev:all
+```
+
+Then open http://localhost:5880/ in a browser.
+
+`dev:all` starts several local servers and needs these ports free: 5880 (the app), 5882 (Home), 5883 (Docs), 5884 (Tasks, Opus), 5888 (Tasks, GLM). The template text further below names the template's default ports (5173, 30xx); this app uses the ports listed here.
+
+## Pages
+
+| Page | Address | Built by |
+|---|---|---|
+| Home | http://localhost:5880/?screen=home | first step |
+| Docs | http://localhost:5880/?screen=docs | first step |
+| Tasks (Opus) | http://localhost:5880/?screen=tasks-opus | Claude Opus |
+| Tasks (GLM) | http://localhost:5880/?screen=tasks-glm | GLM |
+
+The page code lives in `src-app/mfe_packages/`: `home-mfe`, `docs-mfe`, `tasks-opus-mfe`, `tasks-glm-mfe`.
+
+## Design options
+
+Before building its Tasks page, each agent wrote a page with design options to choose from. Both are plain HTML files: open them straight from disk in a browser, no server needed.
+
+- Claude Opus: `.frontx/proposals/team-tasks/r1/proposal.html`
+- GLM: `.frontx/proposals/tasks/r1/proposal.html`
+
+The same folders hold the option that was chosen (`CHOICE.md`) and the survey of the project the agent made first (`survey.json`).
+
+---
+
 # FrontX Standard Template
 
 A complete, runnable **FrontX application** — a host shell wired to the FrontX

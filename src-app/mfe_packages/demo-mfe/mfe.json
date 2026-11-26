@@ -31,7 +31,7 @@
   ],
   "manifest": {
     "id": "gts.frontx.mfes.mfe.mf_manifest.v1~frontx.demo.mfe.manifest.v1",
-    "remoteEntry": "http://localhost:3001/assets/remoteEntry.js"
+    "remoteEntry": "http://localhost:5881/assets/remoteEntry.js"
   },
   "domains": [
     {

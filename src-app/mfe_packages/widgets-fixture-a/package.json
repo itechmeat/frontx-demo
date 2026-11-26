@@ -5,10 +5,10 @@
   "type": "module",
   "description": "Leaf widget MFE. Targets the widgets domain (owned by demo-mfe's child FrontX app at runtime) via two Extension instances (alpha and beta) sharing the same entry path. Mounts concurrently alongside widgets-fixture-b under ConcurrentMountStrategy.",
   "scripts": {
-    "dev": "vite build && vite preview --port 3201",
+    "dev": "vite build && vite preview --port 5886",
     "build": "vite build",
     "type-check": "tsc --noEmit",
-    "preview": "vite preview --port 3201",
+    "preview": "vite preview --port 5886",
     "test": "npm run test:unit",
     "test:unit": "vitest --run --passWithNoTests=false",
     "test:unit:watch": "vitest --watch"

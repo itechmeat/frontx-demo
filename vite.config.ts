@@ -10,6 +10,9 @@ export default defineConfig({
   // from, at the root of a domain or under any sub-path. The dev server keeps
   // `/`. Deploying `dist/` is described in README.md, "Deploying the build".
   base: './',
+  // Local ports of this copy: the shell serves on 5880 and fails instead of moving to another port.
+  server: { port: 5880, strictPort: true },
+  preview: { port: 5880, strictPort: true },
   plugins: [
     react(),
     federation({

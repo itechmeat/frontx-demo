@@ -1,0 +1,209 @@
+/*
+ * The Tasks page. Phone first: the base rules are the 390 px layout; wider
+ * layouts come in with min-width queries (768 px tablet, 1200 px desktop).
+ * The content column runs from the window edge minus 20 px on a phone to
+ * 68 px from 1200 px up, the same line as on every other page.
+ */
+:host {
+  --frontx-screen-inline-padding: 0;
+}
+
+.screen {
+  min-height: 100%;
+}
+
+.page {
+  --background: var(--app-page);
+  --foreground: var(--app-navy);
+  --card: var(--app-page);
+  --card-hover: var(--app-page);
+  --card-foreground: var(--app-navy);
+  --muted-foreground: var(--app-muted);
+  --border: var(--app-line);
+  --input: var(--app-line);
+  --primary: var(--app-accent);
+  --primary-hover: var(--app-accent-hover);
+  --primary-ring: var(--app-accent-hover);
+  --ring: var(--app-accent);
+  --accent: var(--app-accent);
+
+  --gutter: var(--app-gutter-phone);
+
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-10);
+  min-height: 100%;
+  padding: var(--space-14) var(--gutter) var(--space-14);
+  background-color: var(--app-page);
+  color: var(--app-navy);
+}
+
+/*
+ * The filter and the board it filters sit in one group, so the page's region
+ * gap (--space-10, as between head and content on every page) does not also
+ * separate the filter from the thing it filters.
+ */
+.content {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+/* ---------- Page head, as on the Docs page ---------- */
+
+.head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.pageTitle {
+  margin: 0;
+  color: var(--app-navy);
+  font-size: var(--text-page-phone-size);
+  font-weight: 600;
+  line-height: var(--text-page-phone-line-height);
+  letter-spacing: var(--app-tracking-tight);
+}
+
+.headLead {
+  margin: 0;
+  max-width: var(--app-lead-measure);
+  color: var(--app-muted);
+  font-size: var(--text-lead-size);
+  line-height: var(--text-lead-line-height);
+}
+
+/* ---------- Phone status filter ---------- */
+
+.filter {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  max-width: var(--app-measure);
+}
+
+.selectTrigger {
+  width: 100%;
+}
+
+/* ---------- The board: one quiet region per status, task tiles as cards.
+   The board itself is a kit gap (no kit board component): columns compose
+   from CSS Modules on kit tokens, the tiles are kit Cards. ---------- */
+
+.board {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-4);
+  align-items: start;
+}
+
+.column {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+  padding: var(--space-3);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-xl);
+  background-color: var(--muted);
+}
+
+/* A narrowed board spans its one column across the whole row. */
+.columnFull {
+  grid-column: 1 / -1;
+}
+
+.columnHeading {
+  margin: 0;
+}
+
+.columnToggle {
+  max-width: 100%;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.columnLabelStatic {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-2);
+}
+
+.columnLabel {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tiles {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.tile {
+  min-width: 0;
+}
+
+.tileBody {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.tileTitle {
+  overflow-wrap: anywhere;
+  font-size: var(--text-body-size);
+  font-weight: 500;
+  line-height: var(--text-body-line-height);
+  color: var(--card-foreground);
+}
+
+.tileMeta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.tileDue {
+  margin-left: auto;
+}
+
+.tileBadge {
+  flex: none;
+}
+
+/* ---------- Tablet: the four columns wrap two by two ---------- */
+
+@media (min-width: 768px) {
+  .page {
+    --gutter: var(--space-10);
+  }
+
+  .pageTitle {
+    font-size: var(--text-page-size);
+    line-height: var(--text-page-line-height);
+  }
+
+  .board {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--space-5);
+  }
+}
+
+/* ---------- Desktop: a column per status, side by side ---------- */
+
+@media (min-width: 1200px) {
+  .page {
+    --gutter: var(--app-gutter);
+  }
+
+  .board {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}

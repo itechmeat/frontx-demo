@@ -25,7 +25,7 @@ export default defineConfig({
   plugins: [
     react(),
     federation({
-      name: 'tasksMfe',
+      name: 'tasksGlmMfe',
       filename: 'remoteEntry.js',
       exposes: {
         './lifecycle': './src/lifecycle.tsx',
